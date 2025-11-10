@@ -11,6 +11,7 @@ from pptx import Presentation
 from pptx.util import Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_AUTO_SIZE
 import comtypes.client
 from datetime import datetime
 import img2pdf
@@ -61,6 +62,7 @@ def pptx_to_pdf(input_pptx, output_pdf, stop_event):
 def replace_text(shape, placeholder, value, font_settings=None):
     if shape.has_text_frame:
         text_frame = shape.text_frame
+        
         for paragraph in text_frame.paragraphs:
             original_text = paragraph.text
             if placeholder in original_text:
@@ -68,18 +70,28 @@ def replace_text(shape, placeholder, value, font_settings=None):
                 if runs:
                     full_text = "".join(run.text for run in runs)
                     new_text = full_text.replace(placeholder, value)
+                    
+                    # Если текст стал значительно длиннее, уменьшаем шрифт
+                    original_font = runs[0].font
+                    font_size = original_font.size.pt if original_font.size else 12
+                    
+                    # Эвристика: уменьшаем шрифт если новый текст значительно длиннее
+                    if len(new_text) > len(full_text) * 1.5:  # на 50% длиннее
+                        font_size = max(font_size * 0.8, 6)  # уменьшаем на 20%, но не меньше 6pt
+                    
                     paragraph.clear()
                     new_run = paragraph.add_run()
                     new_run.text = new_text
-                    original_font = runs[0].font
+                    
                     if font_settings and font_settings["use_custom"]:
                         new_run.font.name = font_settings["name"]
                         new_run.font.size = Pt(font_settings["size"])
                         new_run.font.bold = font_settings.get("bold", False)
                     else:
-                        new_run.font.size = original_font.size
+                        new_run.font.size = Pt(font_size)
                         new_run.font.bold = original_font.bold
                         new_run.font.name = original_font.name
+                    
                     new_run.font.color.rgb = RGBColor(127, 127, 127)
                     paragraph.alignment = paragraph.alignment or PP_ALIGN.CENTER
                 else:
@@ -91,6 +103,14 @@ def replace_text(shape, placeholder, value, font_settings=None):
                             run.font.bold = font_settings.get("bold", False)
                         run.font.color.rgb = RGBColor(127, 127, 127)
                     paragraph.alignment = PP_ALIGN.CENTER
+        
+        # Принудительно включаем автоподбор
+        try:
+            text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        except:
+            # Если MSO_AUTO_SIZE недоступен, пробуем альтернативный способ
+            text_frame.auto_size = None
+            text_frame.word_wrap = True
 
 def generate_diplomas(excel_path, ppt_template, output_dir, column_mapping, error_handling, default_values, font_settings, sort_column, enable_sorting, log_queue, progress_queue, eta_queue, stop_event):
     wb = load_workbook(excel_path)
