@@ -26,23 +26,59 @@ def pptx_to_pdf(input_pptx, output_pdf, stop_event):
         powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
         powerpoint.Visible = 1
         deck = powerpoint.Presentations.Open(input_pptx)
+        
         if stop_event.is_set():
             deck.Close()
             return False
+        
+        # Получаем реальные размеры слайда в точках (points)
+        slide_width_pt = deck.PageSetup.SlideWidth
+        slide_height_pt = deck.PageSetup.SlideHeight
+        
+        # Переводим точки в дюймы (1 дюйм = 72 точки)
+        slide_width_in = slide_width_pt / 72
+        slide_height_in = slide_height_pt / 72
+        
+        # Для высокого качества (300 DPI)
+        dpi = 300
+        export_width = int(slide_width_in * dpi)
+        export_height = int(slide_height_in * dpi)
+        
+        # Ограничиваем максимальный размер
+        max_export = 4000
+        export_width = min(export_width, max_export)
+        export_height = min(export_height, max_export)
+        
         temp_jpg = input_pptx.replace(".pptx", ".jpg")
-        deck.Slides[1].Export(temp_jpg, "JPG", 3508, 2480)
+        deck.Slides[1].Export(temp_jpg, "JPG", export_width, export_height)
+        
         deck.Close()
         
         if stop_event.is_set():
             os.remove(temp_jpg) if os.path.exists(temp_jpg) else None
             return False
         
-        a4inpt = (img2pdf.mm_to_pt(297), img2pdf.mm_to_pt(210))
-        layout = img2pdf.get_layout_fun(a4inpt)
+        # Конвертируем дюймы в миллиметры (1 дюйм = 25.4 мм)
+        slide_width_mm = slide_width_in * 25.4
+        slide_height_mm = slide_height_in * 25.4
+        
+        # Конвертируем мм в точки для PDF (1 мм = 2.83465 точек)
+        pdf_width = slide_width_mm * 2.83465
+        pdf_height = slide_height_mm * 2.83465
+        
+        # Используем правильную функцию img2pdf
+        layout = img2pdf.get_layout_fun((pdf_width, pdf_height))
+        
         with open(output_pdf, "wb") as f:
             f.write(img2pdf.convert(temp_jpg, layout_fun=layout))
         
         os.remove(temp_jpg)
+        
+        # Логи для отладки
+        log_message = f"Размер слайда: {slide_width_mm:.1f}x{slide_height_mm:.1f} мм"
+        import sys
+        sys.stderr.write(f"{log_message}\n")
+        
         return True
     except Exception as e:
         raise Exception(f"Ошибка конвертации: {e}")
@@ -66,114 +102,190 @@ def replace_text(shape, placeholder, value, font_settings=None):
         for paragraph in text_frame.paragraphs:
             original_text = paragraph.text
             if placeholder in original_text:
-                runs = paragraph.runs
-                if runs:
-                    full_text = "".join(run.text for run in runs)
-                    new_text = full_text.replace(placeholder, value)
-                    
-                    # Если текст стал значительно длиннее, уменьшаем шрифт
-                    original_font = runs[0].font
-                    font_size = original_font.size.pt if original_font.size else 12
-                    
-                    # Эвристика: уменьшаем шрифт если новый текст значительно длиннее
-                    if len(new_text) > len(full_text) * 1.5:  # на 50% длиннее
-                        font_size = max(font_size * 0.8, 6)  # уменьшаем на 20%, но не меньше 6pt
-                    
-                    paragraph.clear()
-                    new_run = paragraph.add_run()
-                    new_run.text = new_text
-                    
-                    if font_settings and font_settings["use_custom"]:
-                        new_run.font.name = font_settings["name"]
-                        new_run.font.size = Pt(font_settings["size"])
-                        new_run.font.bold = font_settings.get("bold", False)
-                    else:
-                        new_run.font.size = Pt(font_size)
-                        new_run.font.bold = original_font.bold
-                        new_run.font.name = original_font.name
-                    
-                    new_run.font.color.rgb = RGBColor(127, 127, 127)
-                    paragraph.alignment = paragraph.alignment or PP_ALIGN.CENTER
+                # Простая замена текста
+                if value is None or value == "":
+                    new_text = original_text.replace(placeholder, "")
                 else:
-                    paragraph.text = original_text.replace(placeholder, value)
+                    new_text = original_text.replace(placeholder, str(value))
+                
+                # Сохраняем все форматирование runs
+                if paragraph.runs:
+                    # Находим все вхождения плейсхолдера в runs
+                    runs_to_process = []
                     for run in paragraph.runs:
-                        if font_settings and font_settings["use_custom"]:
-                            run.font.name = font_settings["name"]
-                            run.font.size = Pt(font_settings["size"])
-                            run.font.bold = font_settings.get("bold", False)
-                        run.font.color.rgb = RGBColor(127, 127, 127)
-                    paragraph.alignment = PP_ALIGN.CENTER
-        
-        # Принудительно включаем автоподбор
-        try:
-            text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-        except:
-            # Если MSO_AUTO_SIZE недоступен, пробуем альтернативный способ
-            text_frame.auto_size = None
-            text_frame.word_wrap = True
-
+                        if placeholder in run.text:
+                            runs_to_process.append(run)
+                    
+                    if runs_to_process:
+                        # Просто заменяем текст в первом run с плейсхолдером
+                        first_run = runs_to_process[0]
+                        first_run.text = first_run.text.replace(placeholder, str(value) if value else "")
+                        
+                        # Удаляем плейсхолдер из остальных runs
+                        for run in runs_to_process[1:]:
+                            run.text = run.text.replace(placeholder, "")
+                    else:
+                        # Если не нашли в runs, заменяем весь текст параграфа
+                        paragraph.text = new_text
+                else:
+                    paragraph.text = new_text
+                    
 def generate_diplomas(excel_path, ppt_template, output_dir, column_mapping, error_handling, default_values, font_settings, sort_column, enable_sorting, log_queue, progress_queue, eta_queue, stop_event):
     wb = load_workbook(excel_path)
     ws = wb.active
-    participants = []
+    all_participants = []
     skipped_rows = []
     
-    headers = [cell.value or f"Столбец {chr(65+i)}" for i, cell in enumerate(ws[1])]
+    # Собираем заголовки
+    headers = []
+    for cell in ws[1]:
+        header = cell.value or ""
+        if header and header.startswith("{") and header.endswith("}"):
+            headers.append(header.strip("{}"))
+        else:
+            headers.append(header if header else f"Столбец_{chr(65 + cell.column - 1)}")
+    
+    log_queue.put(f"Найдено заголовков: {len(headers)}")
+    
+    # Определяем колонки с участниками и тренерами
+    participant_columns = []
+    trainer_columns = []
+    for i, header in enumerate(headers):
+        if isinstance(header, str):
+            if header.startswith("FullN"):
+                participant_columns.append(i)
+            elif header.startswith("FullTr"):
+                trainer_columns.append(i)
+    
+    log_queue.put(f"Колонки участников: {len(participant_columns)}")
+    log_queue.put(f"Колонки тренеров: {len(trainer_columns)}")
+    
+    # Обрабатываем строки
+    row_count = 0
+    total_participants = 0
+    
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if stop_event.is_set():
             log_queue.put("Генерация прервана")
             return False
-        participant = {}
-        valid = True
-        for placeholder, col_name in column_mapping.items():
-            col_idx = headers.index(col_name) if col_name in headers else ord(col_name) - ord('A')
-            value = row[col_idx]
-            if value is None:
-                if error_handling == "skip":
-                    skipped_rows.append(f"Строка {row_idx}: пустое поле {placeholder} ({col_name})")
-                    valid = False
-                    break
-                elif error_handling == "default":
-                    value = default_values.get(placeholder, "Не указано")
-                else:
-                    log_queue.put(f"Ошибка: пустое поле {placeholder} ({col_name}) в строке {row_idx}")
-                    return False
-            if placeholder == "DATE" and isinstance(value, datetime):
-                value = value.strftime("%d.%m.%Y")
-            elif placeholder == "DATE" and isinstance(value, str):
-                for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d"]:
-                    try:
-                        value = datetime.strptime(value, fmt).strftime("%d.%m.%Y")
-                        break
-                    except ValueError:
-                        pass
-            participant[placeholder] = str(value)
-        if valid:
-            participants.append(participant)
+        
+        # Проверяем наличие участников
+        has_participant = False
+        for col_idx in participant_columns:
+            if col_idx < len(row) and row[col_idx] and str(row[col_idx]).strip():
+                has_participant = True
+                break
+        
+        if not has_participant:
+            skipped_rows.append(f"Строка {row_idx}")
+            continue
+        
+        row_count += 1
+        
+        # Собираем основные данные
+        base_data = {}
+        for i, value in enumerate(row):
+            if i < len(headers) and value is not None and str(value).strip():
+                placeholder = headers[i]
+                base_data[placeholder] = str(value).strip()
+        
+        team_name = base_data.get('TEAMNAME', 'без команды')
+        log_queue.put(f"Строка {row_idx}: {team_name}")
+        
+        # Ищем первого непустого тренера в строке
+        trainer_found = None
+        for col_idx in trainer_columns:
+            if col_idx < len(row) and row[col_idx] and str(row[col_idx]).strip():
+                trainer_found = str(row[col_idx]).strip()
+                break
+        
+        # Добавляем тренера в базовые данные если нашли
+        if trainer_found:
+            base_data["TRAINER"] = trainer_found
+        
+        # Обрабатываем каждого участника
+        participants_in_row = 0
+        for col_idx in participant_columns:
+            if col_idx < len(row) and row[col_idx] and str(row[col_idx]).strip():
+                # Создаем копию данных для участника
+                participant_data = {}
+                
+                # Копируем все непустые данные
+                for key, val in base_data.items():
+                    if val and str(val).strip():  # Копируем только непустые
+                        participant_data[key] = val
+                
+                # Добавляем имя участника (обязательно)
+                participant_data["NAME"] = str(row[col_idx]).strip()
+                
+                all_participants.append(participant_data)
+                participants_in_row += 1
+                total_participants += 1
+        
+        log_queue.put(f"  Участников: {participants_in_row}")
     
+    # Отчет
     if skipped_rows:
-        log_queue.put(f"Пропущены строки: {len(skipped_rows)}. Подробности: {'; '.join(skipped_rows)}")
+        log_queue.put(f"Пропущено строк без участников: {len(skipped_rows)}")
+    
+    log_queue.put(f"Строк с данными: {row_count}")
+    log_queue.put(f"Всего участников: {total_participants}")
+    
+    if total_participants == 0:
+        log_queue.put("Нет участников для генерации!")
+        return False
     
     os.makedirs(output_dir, exist_ok=True)
     
-    total = len(participants)
+    # Генерация
     processing_times = []
-    for idx, participant in enumerate(participants, 1):
+    
+    for idx, participant in enumerate(all_participants, 1):
         if stop_event.is_set():
             log_queue.put("Генерация прервана")
             return False
+        
         start_time = time.time()
+        
         prs = Presentation(ppt_template)
         slide = prs.slides[0]
         
+        # Заменяем только НЕПУСТЫЕ плейсхолдеры
         for shape in slide.shapes:
-            for placeholder in participant:
-                replace_text(shape, "{" + placeholder + "}", participant[placeholder], font_settings)
+            for placeholder, value in participant.items():
+                # Пропускаем пустые значения
+                if value and str(value).strip():
+                    replace_text(shape, "{" + placeholder + "}", value, font_settings)
+                else:
+                    # Если значение пустое, удаляем плейсхолдер
+                    replace_text(shape, "{" + placeholder + "}", "", font_settings)
         
+        # Также удаляем плейсхолдеры, которых нет в данных
+        all_placeholders_in_template = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for paragraph in shape.text_frame.paragraphs:
+                    matches = re.findall(r"\{([^}]+)\}", paragraph.text)
+                    all_placeholders_in_template.extend(matches)
+        
+        # Удаляем плейсхолдеры, для которых нет данных
+        for placeholder in set(all_placeholders_in_template):
+            if placeholder not in participant:
+                for shape in slide.shapes:
+                    replace_text(shape, "{" + placeholder + "}", "", font_settings)
+        
+        # Создаем имя файла
         safe_name = re.sub(r'[\\/*?:"<>|]', "_", participant.get("NAME", "unknown"))
-        pdf_name = f"{safe_name}.pdf"
+        team = participant.get("TEAMNAME", "")
         
-        if enable_sorting and sort_column:
+        if team:
+            safe_team = re.sub(r'[\\/*?:"<>|]', "_", team)
+            pdf_name = f"{safe_team}_{safe_name}.pdf"
+        else:
+            pdf_name = f"{safe_name}.pdf"
+        
+        # Сортировка
+        if enable_sorting and sort_column and sort_column in participant:
             safe_sort_value = re.sub(r'[\\/*?:"<>|]', "_", participant.get(sort_column, "unknown"))
             subdir = os.path.join(output_dir, safe_sort_value)
             os.makedirs(subdir, exist_ok=True)
@@ -181,29 +293,36 @@ def generate_diplomas(excel_path, ppt_template, output_dir, column_mapping, erro
         else:
             pdf_path = os.path.join(output_dir, pdf_name)
         
-        temp_pptx = os.path.abspath(f"temp_{safe_name}.pptx")
+        # Сохраняем и конвертируем
+        temp_pptx = os.path.abspath(f"temp_{safe_name}_{idx}.pptx")
         prs.save(temp_pptx)
+        
         try:
             if not pptx_to_pdf(temp_pptx, pdf_path, stop_event):
                 return False
-            log_queue.put(f"Сгенерирован диплом: {pdf_name}")
+            log_queue.put(f"Создан: {pdf_name}")
         except Exception as e:
-            log_queue.put(str(e))
+            log_queue.put(f"Ошибка: {pdf_name} - {e}")
             return False
         finally:
-            os.remove(temp_pptx) if os.path.exists(temp_pptx) else None
+            if os.path.exists(temp_pptx):
+                os.remove(temp_pptx)
+        
+        # Прогресс
         processing_time = time.time() - start_time
         processing_times.append(processing_time)
         
-        progress_queue.put(idx / total * 100)
+        progress_queue.put(idx / total_participants * 100)
+        
         if processing_times:
             avg_time = sum(processing_times) / len(processing_times)
-            remaining_records = total - idx
-            eta_seconds = int(avg_time * remaining_records)
+            remaining = total_participants - idx
+            eta_seconds = int(avg_time * remaining)
             eta_str = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
             eta_queue.put(eta_str)
     
-    log_queue.put(f"Дипломы сохранены в: {output_dir}")
+    log_queue.put(f"Готово! Сохранено в: {output_dir}")
+    log_queue.put(f"Документов: {total_participants}")
     eta_queue.put("00:00")
     return True
 
@@ -467,16 +586,26 @@ class DiplomaGeneratorApp(wx.Frame):
             prs = Presentation(self.pptx_path)
             slide = prs.slides[0]
             self.placeholders = []
+            
             for shape in slide.shapes:
                 if shape.has_text_frame:
                     for paragraph in shape.text_frame.paragraphs:
                         matches = re.findall(r"\{([^}]+)\}", paragraph.text)
                         self.placeholders.extend(matches)
+            
             self.placeholders = list(set(self.placeholders))
+            
+            # Автоматически добавляем обязательные плейсхолдеры если их нет
+            mandatory = ["NAME"]
+            for mandatory_ph in mandatory:
+                if mandatory_ph not in self.placeholders:
+                    self.placeholders.append(mandatory_ph)
+            
             self.log_message(f"Найдены плейсхолдеры: {', '.join(self.placeholders)}")
             self.update_sort_choice()
             self.sort_check.Enable(True)
             self.sort_choice.Enable(True)
+            
         except Exception as e:
             self.log_message(f"Ошибка сканирования шаблона: {e}")
             self.sort_check.Enable(False)
@@ -591,19 +720,49 @@ class DiplomaGeneratorApp(wx.Frame):
     
     def auto_map(self, headers):
         synonyms = {
-            "NAME": ["ФИО", "Имя", "Name", "Full Name"],
-            "REGN": ["Номер", "Регистрация", "Reg", "ID"],
-            "LEARN": ["Курс", "Программа", "Learn", "Course"],
-            "TIME": ["Часы", "Время", "Hours", "Duration"],
-            "DATE": ["Дата", "Date"]
+            "NAME": ["FullN", "ФИО", "Имя", "Name", "Full Name", "Участник"],
+            "ORG": ["ORG", "Организация", "Учреждение", "Школа", "Organization"],
+            "TEAM": ["TEAMNAME", "Команда", "Team", "Название команды"],
+            "CAT": ["CAT", "Категория", "Category", "Номинация", "Возраст"],
+            "TRAINER": ["FullTr", "Тренер", "Руководитель", "Teacher", "Coach"],
+            "DATE": ["Дата", "Date", "Год", "Year"],
+            "PLACE": ["Место", "Place", "Position", "Rank"],
+            "CITY": ["Город", "City", "Населенный пункт", "Location"]
         }
+        
         for placeholder in self.placeholders:
             choice = self.mapping_choices[placeholder]
+            
+            # Пытаемся найти точное совпадение
+            found = False
             for header in headers:
-                if header and any(syn.lower() in header.lower() for syn in synonyms.get(placeholder, [placeholder])):
+                if header and placeholder.upper() == header.upper():
                     choice.SetStringSelection(header)
+                    found = True
                     break
-        self.log_message("Выполнено автосопоставление")
+            
+            # Если не нашли, ищем по синонимам
+            if not found:
+                for header in headers:
+                    if header:
+                        # Проверяем синонимы
+                        for syn_list in synonyms.values():
+                            for syn in syn_list:
+                                if syn.lower() in header.lower():
+                                    choice.SetStringSelection(header)
+                                    found = True
+                                    break
+                            if found:
+                                break
+                    if found:
+                        break
+            
+            # Если всё равно не нашли, ставим первый столбец с участником
+            if not found and placeholder == "NAME":
+                for header in headers:
+                    if header and ("FullN" in header or "ФИО" in header):
+                        choice.SetStringSelection(header)
+                        break
     
     def check_data(self, headers, ws):
         errors = []
