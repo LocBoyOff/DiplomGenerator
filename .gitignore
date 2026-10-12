@@ -1,11 +1,8 @@
 __pycache__/
 *.py[cod]
-.qa/
-output/
 .venv-build/
 build/
 dist/
-release-assets/
 config.json
 temp_*.pptx
 temp_*.jpg

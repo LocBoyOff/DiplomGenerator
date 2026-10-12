@@ -6,7 +6,7 @@
 
 Скачайте [DiplomaGenerator.exe](https://github.com/LocBoyOff/DiplomGenerator/releases/latest/download/DiplomaGenerator.exe) или архив с инструкцией из [последнего релиза](https://github.com/LocBoyOff/DiplomGenerator/releases/latest). EXE содержит Python и библиотеки; отдельно устанавливать Python не нужно. Поддерживается Windows x64. Microsoft PowerPoint должен быть установлен и активирован.
 
-Изменения версии — в [CHANGELOG](CHANGELOG.md) и [описании релиза 2.0.0](release-notes/v2.0.0.md).
+Изменения версии — в [описании релиза 2.0.0](https://github.com/LocBoyOff/DiplomGenerator/releases/tag/v2.0.0).
 
 ## Запуск из исходников
 
@@ -62,29 +62,15 @@ PowerPoint экспортирует PDF с качеством для печат�
 
 Настройки и подробный журнал с трассировками хранятся в `%LOCALAPPDATA%\DiplomaGenerator`. Журнал ограничен по размеру и доступен по кнопке в приложении. Старый `config.json` в рабочей папке больше не используется.
 
-## Структура и проверки
+## Структура проекта
 
-- `diploma_generator.py` — интерфейс на wxPython и запуск.
-- `diploma_core.py` — чтение данных, оба режима, замена текста, файлы и изолированный экспорт Office.
-- `pdf_quality.py` — восстановление исходных пикселей картинок после экспорта Office.
-- `test_pdf_quality.py` — проверки качества, прозрачности, сопоставления картинок и сохранности текста/геометрии.
-- `test_diploma_core.py` — автоматические проверки на временных Excel/PPTX.
-- `test_office_integration.py` — дополнительные проверки реального Office: шрифты, уменьшение текста, смешанное оформление, группы, таблицы и экспорт в обоих режимах.
-- `diploma_generator_orig.py` — архив исходной версии, сохранён для сравнения; используйте режим orig в основном приложении.
-- `diploma_generatortest.py` — совместимый запуск основного приложения.
-
-```powershell
-python -m unittest -v test_diploma_core test_pdf_quality
-```
-
-Автоматические проверки используют тестовый конвертер и не требуют PowerPoint. Реальная совместимость с Office проверяется отдельным экспортом на машине с установленным PowerPoint.
-
-Для проверки установленного PowerPoint (создаёт временные тестовые презентации):
-
-```powershell
-$env:RUN_OFFICE_TESTS = "1"
-python -m unittest -v test_diploma_core test_pdf_quality test_office_integration
-```
+- `diploma_generator.py` — интерфейс и запуск приложения.
+- `diploma_core.py` — чтение Excel, оба режима генерации, подстановка текста и экспорт Office.
+- `pdf_quality.py` — сохранение исходного качества картинок в PDF.
+- `app_version.py` — номер версии приложения.
+- `assets/` — иконка и сведения о версии EXE.
+- `requirements.txt` — зависимости для запуска из исходников.
+- `requirements-build.txt`, `DiplomaGenerator.spec`, `build_release.ps1` — сборка Windows EXE.
 
 ## Качество фоновых картинок
 
@@ -101,11 +87,3 @@ python -m unittest -v test_diploma_core test_pdf_quality test_office_integration
 ```
 
 Результат — `dist\DiplomaGenerator.exe`. Рабочие файлы, личные дипломы, настройки и журналы в EXE не включаются.
-
-Для проверки готового EXE на синтетической таблице и шаблоне нужен установленный PowerPoint:
-
-```powershell
-.\dist\DiplomaGenerator.exe --self-test .\build\self-test
-```
-
-Проверка создаёт PDF для обоих режимов и `report.json` в указанной папке. Она проверяет создание интерфейса, подстановку текста, шрифты и точное сохранение пикселей фоновой картинки. Пользовательские настройки и таблицы не используются.

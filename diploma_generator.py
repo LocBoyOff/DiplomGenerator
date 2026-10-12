@@ -28,13 +28,13 @@ ACCENT = '#375BDD'
 
 
 class DiplomaGeneratorApp(wx.Frame):
-    def __init__(self, settings=None):
+    def __init__(self):
         super().__init__(None, title='Генератор дипломов', size=(1180, 850))
         self.SetMinSize((1000, 760))
         icon_path = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'assets' / 'app.ico'
         if icon_path.is_file():
             self.SetIcon(wx.Icon(str(icon_path), wx.BITMAP_TYPE_ICO))
-        self.settings = settings or Settings()
+        self.settings = Settings()
         self.events = queue.Queue()
         self.stop_event = threading.Event()
         self.worker = None
@@ -43,11 +43,10 @@ class DiplomaGeneratorApp(wx.Frame):
         self.locked_controls = []
         self.last_output = ''
         self.setup_ui()
-        if settings is None:
-            try:
-                self.settings = load_settings()
-            except DiplomaError as exc:
-                self.log(str(exc))
+        try:
+            self.settings = load_settings()
+        except DiplomaError as exc:
+            self.log(str(exc))
         self.apply_settings()
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.timer = wx.Timer(self)
@@ -497,11 +496,6 @@ class DiplomaGeneratorApp(wx.Frame):
 
 def main():
     multiprocessing.freeze_support()
-    if len(sys.argv) > 1 and sys.argv[1] == '--self-test':
-        if len(sys.argv) != 3:
-            raise SystemExit(2)
-        from diagnostics import self_test
-        raise SystemExit(self_test(sys.argv[2]))
     app = wx.App(False)
     try:
         handler = RotatingFileHandler(app_data_dir() / 'diploma.log', maxBytes=2_000_000,
