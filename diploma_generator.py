@@ -1,8 +1,12 @@
 """Desktop interface for both diploma generation modes."""
+import multiprocessing
+if __name__ == '__main__':
+    # Frozen Office workers must skip loading the GUI and its libraries.
+    multiprocessing.freeze_support()
+
 import copy
 import logging
 from logging.handlers import RotatingFileHandler
-import multiprocessing
 import os
 from pathlib import Path
 import queue
@@ -12,7 +16,6 @@ from datetime import datetime
 from app_version import VERSION
 
 import wx
-import wx.grid
 import wx.lib.scrolledpanel
 
 from diploma_core import (

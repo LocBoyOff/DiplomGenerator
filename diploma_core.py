@@ -110,36 +110,58 @@ def format_field(placeholder, value):
 
 def read_excel(value, headers_only=False, stop_event=None):
     path = input_path(value, ".xlsx")
-    wb = formula_wb = None
+    wb = cached_wb = None
     try:
-        wb = load_workbook(path, read_only=True, data_only=True)
+        # Inspect ordinary values and formulas in one pass. Only workbooks that
+        # actually contain formulas need a second reader for cached results.
+        wb = load_workbook(path, read_only=True, data_only=False)
         ws = wb.active
-        if ws is None or ws.max_row < 1:
+        if ws is None or ws.max_row == 0:
             raise DiplomaError("В Excel нет активного листа с данными.")
-        first = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        first = next(ws.iter_rows(min_row=1, max_row=1), ())
+        if any(cell.data_type == "f" for cell in first):
+            cached_wb = load_workbook(path, read_only=True, data_only=True)
+            header_values = next(cached_wb[ws.title].iter_rows(min_row=1, max_row=1, values_only=True), ())
+        else:
+            header_values = [cell.value for cell in first]
         headers = [format_value(x).strip("{}").strip() or f"Столбец_{get_column_letter(i)}"
-                   for i, x in enumerate(first, 1)]
-        if len(set(headers)) != len(headers):
-            duplicates = sorted({x for x in headers if headers.count(x) > 1})
+                   for i, x in enumerate(header_values, 1)]
+        from collections import Counter
+        duplicates = sorted(header for header, count in Counter(headers).items() if count > 1)
+        if duplicates:
             raise DiplomaError("Повторяются заголовки Excel: " + ", ".join(duplicates))
         if headers_only:
             return headers, []
-        rows = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        rows, formulas = [], {}
+        for row_index, cells in enumerate(ws.iter_rows(min_row=2), 2):
             if stop_event and stop_event.is_set():
                 raise Cancelled()
-            rows.append(row)
-        formula_wb = load_workbook(path, read_only=True, data_only=False)
-        formulas = formula_wb[ws.title].iter_rows(min_row=2)
-        for row_index, (row, formula_row) in enumerate(zip(rows, formulas), 2):
-            if stop_event and stop_event.is_set():
-                raise Cancelled()
-            for i, cell in enumerate(formula_row):
-                if cell.data_type == "f" and row[i] is None:
-                    raise DiplomaError(f"Ячейка {cell.coordinate}: у формулы нет сохранённого результата. "
-                                       "Откройте Excel, пересчитайте книгу и сохраните её.")
+            values = []
+            for column, cell in enumerate(cells):
                 if cell.data_type == "e":
                     raise DiplomaError(f"Ячейка {cell.coordinate}: ошибка Excel {cell.value}.")
+                if cell.data_type == "f":
+                    formulas.setdefault(row_index, []).append((column, cell.coordinate))
+                    values.append(None)
+                else:
+                    values.append(cell.value)
+            rows.append(tuple(values))
+        if formulas:
+            cached_wb = cached_wb or load_workbook(path, read_only=True, data_only=True)
+            cached_rows = cached_wb[ws.title].iter_rows(min_row=2, max_row=max(formulas), values_only=True)
+            for row_index, cached in enumerate(cached_rows, 2):
+                if stop_event and stop_event.is_set():
+                    raise Cancelled()
+                if row_index not in formulas:
+                    continue
+                values = list(rows[row_index - 2])
+                for column, coordinate in formulas[row_index]:
+                    value = cached[column]
+                    if value is None:
+                        raise DiplomaError(f"Ячейка {coordinate}: у формулы нет сохранённого результата. "
+                                           "Откройте Excel, пересчитайте книгу и сохраните её.")
+                    values[column] = value
+                rows[row_index - 2] = tuple(values)
         return headers, rows
     except (DiplomaError, Cancelled):
         raise
@@ -150,8 +172,8 @@ def read_excel(value, headers_only=False, stop_event=None):
     finally:
         if wb:
             wb.close()
-        if formula_wb:
-            formula_wb.close()
+        if cached_wb:
+            cached_wb.close()
 
 
 def frame_targets(shapes, path=()):
@@ -245,12 +267,13 @@ def prepare_plan(settings, stop_event=None):
     for row_index, row in enumerate(rows, 2):
         if stop_event and stop_event.is_set():
             raise Cancelled()
-        if not any(format_value(x) for x in row):
+        formatted = [format_value(value) for value in row]
+        if not any(formatted):
             continue
-        base = {h: format_value(row[i]) for i, h in enumerate(headers)}
+        base = dict(zip(headers, formatted))
         if settings.mode == "team":
-            names = [format_value(row[i]) for i in people if format_value(row[i])]
-            trainer = next((format_value(row[i]) for i in trainers if format_value(row[i])), "")
+            names = [formatted[i] for i in people if formatted[i]]
+            trainer = next((formatted[i] for i in trainers if formatted[i]), "")
             if not names:
                 skipped += 1
                 warnings.append(f"Строка {row_index}: нет участников, строка пропущена.")
@@ -351,7 +374,7 @@ def fill_presentation(prs, values, auto_fit=True, font_settings=None):
     return targets
 
 
-def fit_powerpoint_text(deck, targets):
+def fit_powerpoint_text(deck, targets, slide_index=1):
     """Measure with Office itself and shrink font sizes without changing styles.
 
     PowerPoint does not reliably recalculate normAutofit after external XML edits.
@@ -359,7 +382,7 @@ def fit_powerpoint_text(deck, targets):
     """
     results = []
     for target in targets:
-        shapes = deck.Slides.Item(1).Shapes
+        shapes = deck.Slides.Item(slide_index).Shapes
         for index in target["path"][:-1]:
             shapes = shapes.Item(index).GroupItems
         shape = shapes.Item(target["path"][-1])
@@ -382,10 +405,7 @@ def fit_powerpoint_text(deck, targets):
         height = float(shape.Height) - float(frame.MarginTop) - float(frame.MarginBottom)
         if width <= 0 or height <= 0:
             raise DiplomaError(f"Блок «{target['name']}»: отступы не оставляют места для текста.")
-        runs = [text.Runs(i, 1) for i in range(1, text.Runs().Count + 1)]
-        original_sizes = [float(run.Font.Size) for run in runs]
-        if any(size <= 0 for size in original_sizes):
-            raise DiplomaError(f"Блок «{target['name']}»: не удалось определить размер шрифта.")
+        runs = original_sizes = None
         scale = 1.0
         expected_lines = len(re.split(r"\r\n|[\r\n\v]", text.Text))
         for attempt in range(24):
@@ -394,6 +414,11 @@ def fit_powerpoint_text(deck, targets):
             if (bound_width <= width + 0.2 and bound_height <= height + 0.2
                     and actual_lines <= expected_lines):
                 break
+            if runs is None:
+                runs = [text.Runs(i, 1) for i in range(1, text.Runs().Count + 1)]
+                original_sizes = [float(run.Font.Size) for run in runs]
+                if any(size <= 0 for size in original_sizes):
+                    raise DiplomaError(f"Блок «{target['name']}»: не удалось определить размер шрифта.")
             measured_width = bound_width
             if is_cell and actual_lines > expected_lines:
                 # Table cells force WordWrap and reject the COM setter. Sum the
@@ -536,8 +561,10 @@ def _terminate_owned(identity):
                 process.wait(3)
             except psutil.TimeoutExpired:
                 process.kill()
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        LOG.exception("Could not terminate owned PowerPoint")
+    except psutil.NoSuchProcess:
+        pass  # PowerPoint already quit normally.
+    except psutil.AccessDenied:
+        LOG.warning("Could not terminate owned PowerPoint: access denied")
 
 
 def pptx_to_pdf(input_pptx, output_pdf, stop_event, timeout=90, fit_targets=None, fit_report=None,
@@ -625,54 +652,88 @@ def generate(settings, log, progress, stop_event, converter=None, plan=None):
     started, completed = time.monotonic(), 0
     with tempfile.TemporaryDirectory(prefix="diploma_") as temp:
         temp_dir = Path(temp)
-        for index, record in enumerate(plan.records, 1):
-            if stop_event.is_set():
-                raise Cancelled()
-            try:
+        from contextlib import ExitStack
+        with ExitStack() as resources:
+            session = restorer = None
+            if converter is pptx_to_pdf:
+                from office_session import PowerPointSession
+                from pdf_quality import ImageRestorer
                 prs, _ = read_template(settings.pptx_path)
-                fit_targets = fill_presentation(prs, record.values, settings.auto_fit)
-                pptx, pdf = temp_dir / "document.pptx", temp_dir / "document.pdf"
-                pdf.unlink(missing_ok=True)
-                prs.save(str(pptx))
-                log(f"{index}/{len(plan.records)} · {record.values.get('NAME', '')}: экспорт PDF…")
-                def report_fit(report):
-                    for item in report:
-                        if item["scale"] < 0.999:
-                            log(f"Текст уменьшен в блоке «{item['name']}»: {item['scale']:.0%} от исходного размера.")
-                if converter is pptx_to_pdf:
-                    def report_quality(report):
-                        if report["restored"]:
-                            log(f"Исходное качество картинок восстановлено без потерь: {len(report['restored'])}.")
-                        if report["unmatched"]:
-                            log("Часть картинок не удалось однозначно сопоставить с оригиналом; "
-                                "для них сохранён экспорт Office: " + ", ".join(report["unmatched"]))
-                    converted = converter(str(pptx), str(pdf), stop_event,
-                                          fit_targets=fit_targets, fit_report=report_fit,
-                                          quality_report=report_quality)
-                else:
-                    converted = converter(str(pptx), str(pdf), stop_event)
-                if converted is False:
-                    raise Cancelled()
+                targets = []
+                for frame, target in frame_targets(prs.slides[0].shapes):
+                    if any(PLACEHOLDER.search(p.text) for p in frame.paragraphs):
+                        targets.append(target)
+                        if settings.auto_fit:
+                            frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+                            frame.word_wrap = False
+                for slide_id in list(prs.slides._sldIdLst)[1:]:
+                    prs.part.drop_rel(slide_id.rId)
+                    prs.slides._sldIdLst.remove(slide_id)
+                template = temp_dir / "template.pptx"
+                prs.save(str(template))
+                restorer = ImageRestorer(template)
                 if stop_event.is_set():
                     raise Cancelled()
-                directory = output
-                if settings.enable_sorting:
-                    directory /= safe_component(record.values.get(settings.sort_column, ""))
-                name = safe_component(record.values.get("NAME"), f"Диплом_{record.row}")
-                team = record.values.get("TEAMNAME") or record.values.get("TEAM", "")
-                stem = safe_component(team, limit=50) + "_" + name if team and settings.mode == "team" else name
-                destination = publish_pdf(pdf, directory, stem)
-                completed += 1
-                log(f"Сохранён: {destination}")
-                elapsed = time.monotonic() - started
-                eta = int(elapsed / completed * (len(plan.records) - completed))
-                progress(completed, len(plan.records), eta)
-            except Cancelled:
-                raise
-            except Exception as exc:
-                LOG.exception("Generation failed at Excel row %s", record.row)
-                raise DiplomaError(f"Строка {record.row}, {record.values.get('NAME', '')}: {exc}\n"
-                                   f"Уже сохранено дипломов: {completed}. Папка: {output}") from exc
+                session = resources.enter_context(PowerPointSession(template, targets, stop_event))
+                session.start_export(plan.records[0].values, temp_dir / "document_1.pdf", settings.auto_fit)
+            processing_started = time.monotonic()
+            for index, record in enumerate(plan.records, 1):
+                if stop_event.is_set():
+                    raise Cancelled()
+                try:
+                    pptx = temp_dir / "document.pptx"
+                    pdf = temp_dir / (f"document_{index}.pdf" if session else "document.pdf")
+                    if session is None:
+                        pdf.unlink(missing_ok=True)
+                        prs, _ = read_template(settings.pptx_path)
+                        fill_presentation(prs, record.values, settings.auto_fit)
+                        prs.save(str(pptx))
+                    log(f"{index}/{len(plan.records)} · {record.values.get('NAME', '')}: экспорт PDF…")
+                    def report_fit(report):
+                        for item in report:
+                            if item["scale"] < 0.999:
+                                log(f"Текст уменьшен в блоке «{item['name']}»: {item['scale']:.0%} от исходного размера.")
+                    if converter is pptx_to_pdf:
+                        def report_quality(report):
+                            if report["restored"]:
+                                log(f"Исходное качество картинок восстановлено без потерь: {len(report['restored'])}.")
+                            if report["unmatched"]:
+                                log("Часть картинок не удалось однозначно сопоставить с оригиналом; "
+                                    "для них сохранён экспорт Office: " + ", ".join(report["unmatched"]))
+                        converted = session.finish_export(report_fit)
+                        if stop_event.is_set():
+                            raise Cancelled()
+                        if index < len(plan.records):
+                            # Office renders the next PDF while this process restores
+                            # image quality and publishes the completed one.
+                            session.start_export(plan.records[index].values,
+                                                 temp_dir / f"document_{index + 1}.pdf", settings.auto_fit)
+                        report_quality(restorer.restore(pdf))
+                    else:
+                        converted = converter(str(pptx), str(pdf), stop_event)
+                    if converted is False:
+                        raise Cancelled()
+                    if stop_event.is_set():
+                        raise Cancelled()
+                    directory = output
+                    if settings.enable_sorting:
+                        directory /= safe_component(record.values.get(settings.sort_column, ""))
+                    name = safe_component(record.values.get("NAME"), f"Диплом_{record.row}")
+                    team = record.values.get("TEAMNAME") or record.values.get("TEAM", "")
+                    stem = safe_component(team, limit=50) + "_" + name if team and settings.mode == "team" else name
+                    destination = publish_pdf(pdf, directory, stem)
+                    pdf.unlink(missing_ok=True)
+                    completed += 1
+                    log(f"Сохранён: {destination}")
+                    elapsed = time.monotonic() - processing_started
+                    eta = int(elapsed / completed * (len(plan.records) - completed))
+                    progress(completed, len(plan.records), eta)
+                except Cancelled:
+                    raise
+                except Exception as exc:
+                    LOG.exception("Generation failed at Excel row %s", record.row)
+                    raise DiplomaError(f"Строка {record.row}, {record.values.get('NAME', '')}: {exc}\n"
+                                       f"Уже сохранено дипломов: {completed}. Папка: {output}") from exc
     return completed
 
 
