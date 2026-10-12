@@ -1,886 +1,520 @@
+"""Desktop interface for both diploma generation modes."""
+import copy
+import logging
+from logging.handlers import RotatingFileHandler
+import multiprocessing
 import os
-import json
-import threading
+from pathlib import Path
 import queue
-import time
-import psutil
+import threading
+import sys
+from datetime import datetime
+from app_version import VERSION
+
 import wx
 import wx.grid
-from openpyxl import load_workbook
-from pptx import Presentation
-from pptx.util import Pt
-from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-from pptx.enum.text import MSO_AUTO_SIZE
-import comtypes.client
-from datetime import datetime
-import img2pdf
-import re
-import io
-from PIL import Image
+import wx.lib.scrolledpanel
 
-# --- Backend Functions (Unchanged) ---
-def pptx_to_pdf(input_pptx, output_pdf, stop_event):
-    powerpoint = None
-    try:
-        powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
-        powerpoint.Visible = 1
-        deck = powerpoint.Presentations.Open(input_pptx)
-        
-        if stop_event.is_set():
-            deck.Close()
-            return False
-        
-        # Получаем реальные размеры слайда в точках (points)
-        slide_width_pt = deck.PageSetup.SlideWidth
-        slide_height_pt = deck.PageSetup.SlideHeight
-        
-        # Переводим точки в дюймы (1 дюйм = 72 точки)
-        slide_width_in = slide_width_pt / 72
-        slide_height_in = slide_height_pt / 72
-        
-        # Для высокого качества (300 DPI)
-        dpi = 300
-        export_width = int(slide_width_in * dpi)
-        export_height = int(slide_height_in * dpi)
-        
-        # Ограничиваем максимальный размер
-        max_export = 4000
-        export_width = min(export_width, max_export)
-        export_height = min(export_height, max_export)
-        
-        temp_jpg = input_pptx.replace(".pptx", ".jpg")
-        deck.Slides[1].Export(temp_jpg, "JPG", export_width, export_height)
-        
-        deck.Close()
-        
-        if stop_event.is_set():
-            os.remove(temp_jpg) if os.path.exists(temp_jpg) else None
-            return False
-        
-        # Конвертируем дюймы в миллиметры (1 дюйм = 25.4 мм)
-        slide_width_mm = slide_width_in * 25.4
-        slide_height_mm = slide_height_in * 25.4
-        
-        # Конвертируем мм в точки для PDF (1 мм = 2.83465 точек)
-        pdf_width = slide_width_mm * 2.83465
-        pdf_height = slide_height_mm * 2.83465
-        
-        # Используем правильную функцию img2pdf
-        layout = img2pdf.get_layout_fun((pdf_width, pdf_height))
-        
-        with open(output_pdf, "wb") as f:
-            f.write(img2pdf.convert(temp_jpg, layout_fun=layout))
-        
-        os.remove(temp_jpg)
-        
-        # Логи для отладки
-        log_message = f"Размер слайда: {slide_width_mm:.1f}x{slide_height_mm:.1f} мм"
-        import sys
-        sys.stderr.write(f"{log_message}\n")
-        
-        return True
-    except Exception as e:
-        raise Exception(f"Ошибка конвертации: {e}")
-    finally:
-        if powerpoint:
-            try:
-                powerpoint.Quit()
-            except:
-                for proc in psutil.process_iter(['name']):
-                    if proc.info['name'].lower() == 'powerpnt.exe':
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except psutil.TimeoutExpired:
-                            proc.kill()
+from diploma_core import (
+    Cancelled, DiplomaError, MODES, POLICIES, Settings, app_data_dir,
+    auto_mapping, generate, load_settings, prepare_plan, read_excel,
+    read_template, save_settings,
+)
 
-def replace_text(shape, placeholder, value, font_settings=None):
-    if shape.has_text_frame:
-        text_frame = shape.text_frame
-        
-        for paragraph in text_frame.paragraphs:
-            original_text = paragraph.text
-            if placeholder in original_text:
-                # Простая замена текста
-                if value is None or value == "":
-                    new_text = original_text.replace(placeholder, "")
-                else:
-                    new_text = original_text.replace(placeholder, str(value))
-                
-                # Сохраняем все форматирование runs
-                if paragraph.runs:
-                    # Находим все вхождения плейсхолдера в runs
-                    runs_to_process = []
-                    for run in paragraph.runs:
-                        if placeholder in run.text:
-                            runs_to_process.append(run)
-                    
-                    if runs_to_process:
-                        # Просто заменяем текст в первом run с плейсхолдером
-                        first_run = runs_to_process[0]
-                        first_run.text = first_run.text.replace(placeholder, str(value) if value else "")
-                        
-                        # Удаляем плейсхолдер из остальных runs
-                        for run in runs_to_process[1:]:
-                            run.text = run.text.replace(placeholder, "")
-                    else:
-                        # Если не нашли в runs, заменяем весь текст параграфа
-                        paragraph.text = new_text
-                else:
-                    paragraph.text = new_text
-                    
-def generate_diplomas(excel_path, ppt_template, output_dir, column_mapping, error_handling, default_values, font_settings, sort_column, enable_sorting, log_queue, progress_queue, eta_queue, stop_event):
-    wb = load_workbook(excel_path)
-    ws = wb.active
-    all_participants = []
-    skipped_rows = []
-    
-    # Собираем заголовки
-    headers = []
-    for cell in ws[1]:
-        header = cell.value or ""
-        if header and header.startswith("{") and header.endswith("}"):
-            headers.append(header.strip("{}"))
-        else:
-            headers.append(header if header else f"Столбец_{chr(65 + cell.column - 1)}")
-    
-    log_queue.put(f"Найдено заголовков: {len(headers)}")
-    
-    # Определяем колонки с участниками и тренерами
-    participant_columns = []
-    trainer_columns = []
-    for i, header in enumerate(headers):
-        if isinstance(header, str):
-            if header.startswith("FullN"):
-                participant_columns.append(i)
-            elif header.startswith("FullTr"):
-                trainer_columns.append(i)
-    
-    log_queue.put(f"Колонки участников: {len(participant_columns)}")
-    log_queue.put(f"Колонки тренеров: {len(trainer_columns)}")
-    
-    # Обрабатываем строки
-    row_count = 0
-    total_participants = 0
-    
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        if stop_event.is_set():
-            log_queue.put("Генерация прервана")
-            return False
-        
-        # Проверяем наличие участников
-        has_participant = False
-        for col_idx in participant_columns:
-            if col_idx < len(row) and row[col_idx] and str(row[col_idx]).strip():
-                has_participant = True
-                break
-        
-        if not has_participant:
-            skipped_rows.append(f"Строка {row_idx}")
-            continue
-        
-        row_count += 1
-        
-        # Собираем основные данные
-        base_data = {}
-        for i, value in enumerate(row):
-            if i < len(headers) and value is not None and str(value).strip():
-                placeholder = headers[i]
-                base_data[placeholder] = str(value).strip()
-        
-        team_name = base_data.get('TEAMNAME', 'без команды')
-        log_queue.put(f"Строка {row_idx}: {team_name}")
-        
-        # Ищем первого непустого тренера в строке
-        trainer_found = None
-        for col_idx in trainer_columns:
-            if col_idx < len(row) and row[col_idx] and str(row[col_idx]).strip():
-                trainer_found = str(row[col_idx]).strip()
-                break
-        
-        # Добавляем тренера в базовые данные если нашли
-        if trainer_found:
-            base_data["TRAINER"] = trainer_found
-        
-        # Обрабатываем каждого участника
-        participants_in_row = 0
-        for col_idx in participant_columns:
-            if col_idx < len(row) and row[col_idx] and str(row[col_idx]).strip():
-                # Создаем копию данных для участника
-                participant_data = {}
-                
-                # Копируем все непустые данные
-                for key, val in base_data.items():
-                    if val and str(val).strip():  # Копируем только непустые
-                        participant_data[key] = val
-                
-                # Добавляем имя участника (обязательно)
-                participant_data["NAME"] = str(row[col_idx]).strip()
-                
-                all_participants.append(participant_data)
-                participants_in_row += 1
-                total_participants += 1
-        
-        log_queue.put(f"  Участников: {participants_in_row}")
-    
-    # Отчет
-    if skipped_rows:
-        log_queue.put(f"Пропущено строк без участников: {len(skipped_rows)}")
-    
-    log_queue.put(f"Строк с данными: {row_count}")
-    log_queue.put(f"Всего участников: {total_participants}")
-    
-    if total_participants == 0:
-        log_queue.put("Нет участников для генерации!")
-        return False
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Генерация
-    processing_times = []
-    
-    for idx, participant in enumerate(all_participants, 1):
-        if stop_event.is_set():
-            log_queue.put("Генерация прервана")
-            return False
-        
-        start_time = time.time()
-        
-        prs = Presentation(ppt_template)
-        slide = prs.slides[0]
-        
-        # Заменяем только НЕПУСТЫЕ плейсхолдеры
-        for shape in slide.shapes:
-            for placeholder, value in participant.items():
-                # Пропускаем пустые значения
-                if value and str(value).strip():
-                    replace_text(shape, "{" + placeholder + "}", value, font_settings)
-                else:
-                    # Если значение пустое, удаляем плейсхолдер
-                    replace_text(shape, "{" + placeholder + "}", "", font_settings)
-        
-        # Также удаляем плейсхолдеры, которых нет в данных
-        all_placeholders_in_template = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    matches = re.findall(r"\{([^}]+)\}", paragraph.text)
-                    all_placeholders_in_template.extend(matches)
-        
-        # Удаляем плейсхолдеры, для которых нет данных
-        for placeholder in set(all_placeholders_in_template):
-            if placeholder not in participant:
-                for shape in slide.shapes:
-                    replace_text(shape, "{" + placeholder + "}", "", font_settings)
-        
-        # Создаем имя файла
-        safe_name = re.sub(r'[\\/*?:"<>|]', "_", participant.get("NAME", "unknown"))
-        team = participant.get("TEAMNAME", "")
-        
-        if team:
-            safe_team = re.sub(r'[\\/*?:"<>|]', "_", team)
-            pdf_name = f"{safe_team}_{safe_name}.pdf"
-        else:
-            pdf_name = f"{safe_name}.pdf"
-        
-        # Сортировка
-        if enable_sorting and sort_column and sort_column in participant:
-            safe_sort_value = re.sub(r'[\\/*?:"<>|]', "_", participant.get(sort_column, "unknown"))
-            subdir = os.path.join(output_dir, safe_sort_value)
-            os.makedirs(subdir, exist_ok=True)
-            pdf_path = os.path.join(subdir, pdf_name)
-        else:
-            pdf_path = os.path.join(output_dir, pdf_name)
-        
-        # Сохраняем и конвертируем
-        temp_pptx = os.path.abspath(f"temp_{safe_name}_{idx}.pptx")
-        prs.save(temp_pptx)
-        
-        try:
-            if not pptx_to_pdf(temp_pptx, pdf_path, stop_event):
-                return False
-            log_queue.put(f"Создан: {pdf_name}")
-        except Exception as e:
-            log_queue.put(f"Ошибка: {pdf_name} - {e}")
-            return False
-        finally:
-            if os.path.exists(temp_pptx):
-                os.remove(temp_pptx)
-        
-        # Прогресс
-        processing_time = time.time() - start_time
-        processing_times.append(processing_time)
-        
-        progress_queue.put(idx / total_participants * 100)
-        
-        if processing_times:
-            avg_time = sum(processing_times) / len(processing_times)
-            remaining = total_participants - idx
-            eta_seconds = int(avg_time * remaining)
-            eta_str = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
-            eta_queue.put(eta_str)
-    
-    log_queue.put(f"Готово! Сохранено в: {output_dir}")
-    log_queue.put(f"Документов: {total_participants}")
-    eta_queue.put("00:00")
-    return True
+BG = '#F2F5FA'
+INK = '#19283F'
+MUTED = '#65758B'
+ACCENT = '#375BDD'
 
-# --- GUI Application (wxPython, Updated UI) ---
+
 class DiplomaGeneratorApp(wx.Frame):
-    def __init__(self):
-        super().__init__(None, title="Генератор дипломов", size=(1000, 400))
-        self.SetMinSize((1000, 400))
-        self.SetMaxSize((1000, 400))
-        
-        self.excel_path = ""
-        self.pptx_path = ""
-        self.output_dir = ""
-        self.column_mapping = {}
-        self.placeholders = []
-        self.error_handling = "stop"
-        self.default_values = {}
-        self.font_settings = {"use_custom": False}
-        self.sort_column = ""
-        self.enable_sorting = True
+    def __init__(self, settings=None):
+        super().__init__(None, title='Генератор дипломов', size=(1180, 850))
+        self.SetMinSize((1000, 760))
+        icon_path = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'assets' / 'app.ico'
+        if icon_path.is_file():
+            self.SetIcon(wx.Icon(str(icon_path), wx.BITMAP_TYPE_ICO))
+        self.settings = settings or Settings()
+        self.events = queue.Queue()
         self.stop_event = threading.Event()
-        self.log_queue = queue.Queue()
-        self.progress_queue = queue.Queue()
-        self.eta_queue = queue.Queue()
-        self.generation_thread = None
-        
+        self.worker = None
+        self.busy = False
+        self.closing = False
+        self.locked_controls = []
+        self.last_output = ''
         self.setup_ui()
-        self.load_config()
-        self.Bind(wx.EVT_CLOSE, self.on_closing)
-        
-        # Timer for queue checking
+        if settings is None:
+            try:
+                self.settings = load_settings()
+            except DiplomaError as exc:
+                self.log(str(exc))
+        self.apply_settings()
+        self.Bind(wx.EVT_CLOSE, self.on_close)
         self.timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.check_queues, self.timer)
+        self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
         self.timer.Start(100)
-    
+        self.Centre()
+
+    def label(self, parent, text, size=10, colour=INK, bold=False):
+        item = wx.StaticText(parent, label=text)
+        item.SetForegroundColour(colour)
+        item.SetFont(wx.Font(size, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL,
+                             wx.FONTWEIGHT_BOLD if bold else wx.FONTWEIGHT_NORMAL,
+                             faceName='Segoe UI'))
+        return item
+
+    def button(self, parent, text, handler, primary=False):
+        item = wx.Button(parent, label=text, size=(-1, 36))
+        item.Bind(wx.EVT_BUTTON, handler)
+        if primary:
+            item.SetBackgroundColour(ACCENT)
+            item.SetForegroundColour('white')
+            item.SetFont(wx.Font(10, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL,
+                                 wx.FONTWEIGHT_BOLD, faceName='Segoe UI'))
+        return item
+
+    def card(self, parent, sizer, title, subtitle=None, proportion=0):
+        panel = wx.Panel(parent)
+        panel.SetBackgroundColour('white')
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(self.label(panel, title, 13, bold=True), 0, wx.LEFT | wx.RIGHT | wx.TOP, 14)
+        if subtitle:
+            label = self.label(panel, subtitle, 9, MUTED)
+            label.Wrap(480)
+            outer.Add(label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        content = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(content, 1, wx.EXPAND | wx.ALL, 14)
+        panel.SetSizer(outer)
+        sizer.Add(panel, proportion, wx.EXPAND | wx.BOTTOM, 12)
+        return panel, content
+
     def setup_ui(self):
-        panel = wx.Panel(self)
-        main_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        
-        # Theme
-        self.theme = {"bg": wx.Colour(255, 255, 255), "fg": wx.Colour(0, 0, 0), "button_bg": wx.Colour(76, 175, 80)}
-        panel.SetBackgroundColour(self.theme["bg"])
-        
-        # Fonts with Cyrillic support
-        self.label_font = wx.Font(12, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL, False, "Arial")
-        self.log_font = wx.Font(10, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL, False, "Arial")
-        self.button_font = wx.Font(10, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL, False, "Arial")
-        
-        # Left panel: Inputs and controls
-        left_panel = wx.Panel(panel)
-        left_sizer = wx.GridBagSizer(vgap=5, hgap=5)
-        
-        # Excel file
-        excel_label = wx.StaticText(left_panel, label="Excel-файл:")
-        excel_label.SetFont(self.label_font)
-        self.excel_name = wx.StaticText(left_panel, label="Не выбран")
-        self.excel_name.SetFont(self.label_font)
-        self.excel_path_ctrl = wx.TextCtrl(left_panel, style=wx.TE_READONLY)
-        self.excel_path_ctrl.SetToolTip("Полный путь к файлу Excel")
-        excel_browse_btn = wx.Button(left_panel, label="Выбрать", size=(100, 30))
-        excel_browse_btn.SetBackgroundColour(self.theme["button_bg"])
-        excel_browse_btn.SetForegroundColour(wx.Colour(255, 255, 255))
-        excel_browse_btn.Bind(wx.EVT_BUTTON, self.choose_excel)
-        
-        left_sizer.Add(excel_label, pos=(0, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        left_sizer.Add(self.excel_name, pos=(0, 1), flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
-        left_sizer.Add(self.excel_path_ctrl, pos=(0, 2), flag=wx.EXPAND)
-        left_sizer.Add(excel_browse_btn, pos=(0, 3))
-        
-        # PPTX template
-        pptx_label = wx.StaticText(left_panel, label="Шаблон PPTX:")
-        pptx_label.SetFont(self.label_font)
-        self.pptx_name = wx.StaticText(left_panel, label="Не выбран")
-        self.pptx_name.SetFont(self.label_font)
-        self.pptx_path_ctrl = wx.TextCtrl(left_panel, style=wx.TE_READONLY)
-        self.pptx_path_ctrl.SetToolTip("Полный путь к файлу PPTX")
-        pptx_browse_btn = wx.Button(left_panel, label="Выбрать", size=(100, 30))
-        pptx_browse_btn.SetBackgroundColour(self.theme["button_bg"])
-        pptx_browse_btn.SetForegroundColour(wx.Colour(255, 255, 255))
-        pptx_browse_btn.Bind(wx.EVT_BUTTON, self.choose_pptx)
-        
-        left_sizer.Add(pptx_label, pos=(1, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        left_sizer.Add(self.pptx_name, pos=(1, 1), flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
-        left_sizer.Add(self.pptx_path_ctrl, pos=(1, 2), flag=wx.EXPAND)
-        left_sizer.Add(pptx_browse_btn, pos=(1, 3))
-        
-        # Output directory
-        output_label = wx.StaticText(left_panel, label="Папка:")
-        output_label.SetFont(self.label_font)
-        self.output_name = wx.StaticText(left_panel, label="Не выбрана")
-        self.output_name.SetFont(self.label_font)
-        self.output_path_ctrl = wx.TextCtrl(left_panel, style=wx.TE_READONLY)
-        self.output_path_ctrl.SetToolTip("Полный путь к папке")
-        output_browse_btn = wx.Button(left_panel, label="Выбрать", size=(100, 30))
-        output_browse_btn.SetBackgroundColour(self.theme["button_bg"])
-        output_browse_btn.SetForegroundColour(wx.Colour(255, 255, 255))
-        output_browse_btn.Bind(wx.EVT_BUTTON, self.choose_output)
-        
-        left_sizer.Add(output_label, pos=(2, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        left_sizer.Add(self.output_name, pos=(2, 1), flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
-        left_sizer.Add(self.output_path_ctrl, pos=(2, 2), flag=wx.EXPAND)
-        left_sizer.Add(output_browse_btn, pos=(2, 3))
-        
-        # Error handling
-        error_label = wx.StaticText(left_panel, label="Ошибки:")
-        error_label.SetFont(self.label_font)
-        self.error_handling_choice = wx.Choice(left_panel, choices=["Остановить", "Пропустить", "Заполнить по умолчанию"])
-        self.error_handling_choice.SetSelection(0)
-        self.error_handling_choice.SetToolTip("Как обрабатывать пустые поля в Excel")
-        self.error_handling_choice.Bind(wx.EVT_CHOICE, self.update_error_handling)
-        
-        left_sizer.Add(error_label, pos=(3, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        left_sizer.Add(self.error_handling_choice, pos=(3, 1), span=(1, 2), flag=wx.EXPAND)
-        
-        # Sorting settings
-        sort_label = wx.StaticText(left_panel, label="Сортировка:")
-        sort_label.SetFont(self.label_font)
-        self.sort_check = wx.CheckBox(left_panel, label="Сортировать в папки")
-        self.sort_check.SetValue(self.enable_sorting)
-        self.sort_check.SetToolTip("Включить сортировку дипломов в папки")
-        self.sort_check.Enable(False)
-        self.sort_check.Bind(wx.EVT_CHECKBOX, self.update_sorting)
-        self.sort_choice = wx.Choice(left_panel, choices=[])
-        self.sort_choice.Enable(False)
-        self.sort_choice.SetToolTip("Выберите столбец для сортировки")
-        self.sort_choice.Bind(wx.EVT_CHOICE, self.update_sorting)
-        
-        left_sizer.Add(sort_label, pos=(4, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        left_sizer.Add(self.sort_check, pos=(4, 1))
-        left_sizer.Add(self.sort_choice, pos=(4, 2))
-        
-        left_panel.SetSizer(left_sizer)
-        
-        # Right panel: Progress, ETA, and log
-        right_panel = wx.Panel(panel)
+        root = wx.Panel(self)
+        root.SetBackgroundColour(BG)
+        root.SetFont(wx.Font(10, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL,
+                            wx.FONTWEIGHT_NORMAL, faceName='Segoe UI'))
+        outer = wx.BoxSizer(wx.VERTICAL)
+        header = wx.BoxSizer(wx.HORIZONTAL)
+        heading = wx.BoxSizer(wx.VERTICAL)
+        heading.Add(self.label(root, 'Дипломы для каждого', 25, bold=True))
+        heading.Add(self.label(root, 'Excel → шаблон PowerPoint → готовые PDF', 11, MUTED), 0, wx.TOP, 6)
+        header.Add(heading, 1)
+        self.badge = self.label(root, 'ГОТОВ К РАБОТЕ', 9, ACCENT, True)
+        header.Add(self.badge, 0, wx.ALIGN_CENTER_VERTICAL)
+        outer.Add(header, 0, wx.EXPAND | wx.ALL, 24)
+        body = wx.BoxSizer(wx.HORIZONTAL)
+        left = wx.lib.scrolledpanel.ScrolledPanel(root)
+        left.SetBackgroundColour(BG)
+        left_sizer = wx.BoxSizer(wx.VERTICAL)
+        panel, content = self.card(left, left_sizer, '01  Исходные файлы')
+        self.paths = {}
+        for key, title, hint in (
+            ('excel_path', 'Таблица участников', 'Excel · .xlsx'),
+            ('pptx_path', 'Шаблон диплома', 'PowerPoint · .pptx · первый слайд'),
+            ('output_dir', 'Папка результата', 'Отдельный PDF для каждого участника'),
+        ):
+            content.Add(self.label(panel, title, 10, bold=True), 0, wx.BOTTOM, 4)
+            line = wx.BoxSizer(wx.HORIZONTAL)
+            field = wx.TextCtrl(panel)
+            field.SetHint(hint)
+            field.SetMinSize((-1, 32))
+            field.Bind(wx.EVT_TEXT, self.on_path_changed)
+            browse = self.button(panel, 'Выбрать…', lambda event, k=key: self.choose_path(k))
+            line.Add(field, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+            line.Add(browse, 0)
+            content.Add(line, 0, wx.EXPAND | wx.BOTTOM, 12)
+            self.paths[key] = field
+            self.locked_controls.extend([field, browse])
+        panel, content = self.card(left, left_sizer, '02  Режим генерации')
+        self.mode = wx.Choice(panel, choices=list(MODES.values()))
+        self.mode.Bind(wx.EVT_CHOICE, self.on_mode_changed)
+        content.Add(self.mode, 0, wx.EXPAND)
+        self.mode_hint = self.label(panel, '', 9, MUTED)
+        content.Add(self.mode_hint, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 10)
+        self.mapping_btn = self.button(panel, 'Настроить поля и значения по умолчанию', self.open_mapping)
+        content.Add(self.mapping_btn, 0, wx.EXPAND)
+        self.locked_controls.extend([self.mode, self.mapping_btn])
+        panel, content = self.card(left, left_sizer, '03  Правила и оформление')
+        content.Add(self.label(panel, 'Если обязательное поле пустое', 9, MUTED), 0, wx.BOTTOM, 5)
+        self.policy = wx.Choice(panel, choices=list(POLICIES.values()))
+        content.Add(self.policy, 0, wx.EXPAND | wx.BOTTOM, 12)
+        self.fit = wx.CheckBox(panel, label='Уменьшать длинный текст без переноса строк')
+        self.fit.SetToolTip('Сохраняет шрифт и оформление шаблона. Уменьшает только размер, если текст не помещается. Явные переносы в шаблоне остаются.')
+        content.Add(self.fit, 0, wx.BOTTOM, 12)
+        self.sort = wx.CheckBox(panel, label='Распределять PDF по папкам')
+        self.sort.Bind(wx.EVT_CHECKBOX, self.on_sort_changed)
+        content.Add(self.sort, 0, wx.BOTTOM, 5)
+        self.sort_field = wx.ComboBox(panel, style=wx.CB_READONLY)
+        content.Add(self.sort_field, 0, wx.EXPAND)
+        self.locked_controls.extend([self.policy, self.fit, self.sort, self.sort_field])
+        left.SetSizer(left_sizer)
+        left.SetupScrolling(scroll_x=False)
+        right = wx.lib.scrolledpanel.ScrolledPanel(root)
+        right.SetBackgroundColour(BG)
         right_sizer = wx.BoxSizer(wx.VERTICAL)
-        
-        # Progress bar and ETA
-        progress_label = wx.StaticText(right_panel, label="Прогресс:")
-        progress_label.SetFont(self.label_font)
-        self.progress = wx.Gauge(right_panel, range=100, size=(400, 20))
-        self.eta_label = wx.StaticText(right_panel, label="Осталось: 00:00")
-        self.eta_label.SetFont(self.label_font)
-        
-        right_sizer.Add(progress_label, flag=wx.LEFT | wx.BOTTOM, border=5)
-        right_sizer.Add(self.progress, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
-        right_sizer.Add(self.eta_label, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=5)
-        
-        # Log area
-        log_label = wx.StaticText(right_panel, label="Лог:")
-        log_label.SetFont(self.label_font)
-        self.log = wx.TextCtrl(right_panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL, size=(400, 150))
-        self.log.SetFont(self.log_font)
-        self.log.SetToolTip("Журнал операций и ошибок")
-        
-        right_sizer.Add(log_label, flag=wx.LEFT | wx.BOTTOM, border=5)
-        right_sizer.Add(self.log, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5, proportion=1)
-        
-        right_panel.SetSizer(right_sizer)
-        
-        # Combine panels
-        main_sizer.Add(left_panel, flag=wx.EXPAND | wx.ALL, border=10)
-        main_sizer.Add(right_panel, flag=wx.EXPAND | wx.ALL, border=10, proportion=1)
-        
-        # Bottom buttons
-        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.mapping_btn = wx.Button(panel, label="Сопоставление", size=(150, 40))
-        self.mapping_btn.SetBackgroundColour(self.theme["button_bg"])
-        self.mapping_btn.SetForegroundColour(wx.Colour(255, 255, 255))
-        self.mapping_btn.SetFont(self.button_font)
-        self.mapping_btn.Enable(False)
-        self.mapping_btn.SetToolTip("Свяжите плейсхолдеры PPTX с колонками Excel")
-        self.mapping_btn.Bind(wx.EVT_BUTTON, self.open_mapping_window)
-        
-        self.generate_btn = wx.Button(panel, label="Запустить генерацию", size=(150, 40))
-        self.generate_btn.SetBackgroundColour(wx.Colour(76, 175, 80))
-        self.generate_btn.SetForegroundColour(wx.Colour(255, 255, 255))
-        self.generate_btn.SetFont(self.button_font)
-        self.generate_btn.Enable(False)
-        self.generate_btn.SetToolTip("Начать генерацию дипломов")
-        self.generate_btn.Bind(wx.EVT_BUTTON, self.start_generation)
-        
-        self.stop_btn = wx.Button(panel, label="Прервать", size=(150, 40))
-        self.stop_btn.SetBackgroundColour(wx.Colour(244, 67, 54))
-        self.stop_btn.SetForegroundColour(wx.Colour(255, 255, 255))
-        self.stop_btn.SetFont(self.button_font)
+        panel, content = self.card(right, right_sizer, 'Проверка перед запуском',
+                                   'Проверьте поля и количество дипломов до экспорта.')
+        self.summary = self.label(panel, 'Выберите таблицу и шаблон.', 11, MUTED)
+        self.summary.Wrap(420)
+        content.Add(self.summary, 0, wx.EXPAND | wx.BOTTOM, 16)
+        self.check_btn = self.button(panel, 'Проверить данные', self.check_data)
+        content.Add(self.check_btn, 0, wx.EXPAND)
+        self.locked_controls.append(self.check_btn)
+        panel, content = self.card(right, right_sizer, 'Генерация')
+        self.status = self.label(panel, 'Ожидание запуска', 12, bold=True)
+        content.Add(self.status, 0, wx.BOTTOM, 12)
+        self.gauge = wx.Gauge(panel, range=100, size=(-1, 12))
+        content.Add(self.gauge, 0, wx.EXPAND | wx.BOTTOM, 10)
+        self.progress_text = self.label(panel, '0 из 0  ·  осталось —', 9, MUTED)
+        content.Add(self.progress_text, 0, wx.BOTTOM, 14)
+        actions = wx.BoxSizer(wx.HORIZONTAL)
+        self.start_btn = self.button(panel, 'Создать дипломы', self.start_generation, True)
+        self.stop_btn = self.button(panel, 'Остановить', self.stop_generation)
         self.stop_btn.Enable(False)
-        self.stop_btn.SetToolTip("Остановить генерацию")
-        self.stop_btn.Bind(wx.EVT_BUTTON, self.stop_generation)
-        
-        button_sizer.Add(self.mapping_btn, flag=wx.RIGHT, border=10)
-        button_sizer.Add(self.generate_btn, flag=wx.RIGHT, border=10)
-        button_sizer.Add(self.stop_btn)
-        
-        # Main sizer with buttons at bottom
-        outer_sizer = wx.BoxSizer(wx.VERTICAL)
-        outer_sizer.Add(main_sizer, flag=wx.EXPAND, proportion=1)
-        outer_sizer.Add(button_sizer, flag=wx.ALIGN_CENTER | wx.TOP | wx.BOTTOM, border=10)
-        panel.SetSizer(outer_sizer)
-    
-    def check_queues(self, event):
+        actions.Add(self.start_btn, 1, wx.RIGHT, 8)
+        actions.Add(self.stop_btn, 0)
+        content.Add(actions, 0, wx.EXPAND)
+        self.open_btn = self.button(panel, 'Открыть папку результата', self.open_output)
+        content.Add(self.open_btn, 0, wx.EXPAND | wx.TOP, 8)
+        panel, content = self.card(right, right_sizer, 'Журнал операций', proportion=1)
+        self.log_ctrl = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP)
+        self.log_ctrl.SetMinSize((-1, 100))
+        self.log_ctrl.SetBackgroundColour('#F8FAFD')
+        self.log_ctrl.SetFont(wx.Font(9, wx.FONTFAMILY_MODERN, wx.FONTSTYLE_NORMAL,
+                                     wx.FONTWEIGHT_NORMAL, faceName='Consolas'))
+        content.Add(self.log_ctrl, 1, wx.EXPAND)
+        log_button = self.button(panel, 'Открыть подробный журнал', self.open_log)
+        content.Add(log_button, 0, wx.EXPAND | wx.TOP, 8)
+        right.SetSizer(right_sizer)
+        right.SetupScrolling(scroll_x=False)
+        body.Add(left, 6, wx.EXPAND | wx.RIGHT, 20)
+        body.Add(right, 5, wx.EXPAND)
+        outer.Add(body, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 24)
+        outer.Add(self.label(root, f'Версия {VERSION} · Шаблон сохраняет своё оформление. Для экспорта нужен Microsoft PowerPoint.', 9, MUTED),
+                  0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 24)
+        root.SetSizer(outer)
+        self.SetBackgroundColour(BG)
+
+    def apply_settings(self):
+        for key, field in self.paths.items():
+            field.ChangeValue(getattr(self.settings, key))
+        self.mode.SetSelection(list(MODES).index(self.settings.mode))
+        self.policy.SetSelection(list(POLICIES).index(self.settings.error_handling))
+        self.fit.SetValue(self.settings.auto_fit)
+        self.sort.SetValue(self.settings.enable_sorting)
+        self.refresh_mode_hint()
+        self.refresh_sort_fields()
+
+    def collect_settings(self):
+        settings = copy.deepcopy(self.settings)
+        for key, field in self.paths.items():
+            setattr(settings, key, field.GetValue().strip().strip('"'))
+        settings.mode = list(MODES)[self.mode.GetSelection()]
+        settings.error_handling = list(POLICIES)[self.policy.GetSelection()]
+        settings.auto_fit = self.fit.GetValue()
+        settings.enable_sorting = self.sort.GetValue()
+        settings.sort_column = self.sort_field.GetValue()
+        return settings
+
+    def persist(self):
+        self.settings = self.collect_settings()
         try:
-            while True:
-                message = self.log_queue.get_nowait()
-                message = str(message)
-                wx.CallAfter(self.log.AppendText, f"{datetime.now().strftime('%H:%M:%S')}: {message}\n")
-        except queue.Empty:
+            save_settings(self.settings)
+        except Exception as exc:
+            logging.exception('Could not save settings')
+            self.log(f'Настройки не сохранены: {exc}')
+
+    def refresh_mode_hint(self):
+        team = self.mode.GetSelection() == 1
+        self.mode_hint.SetLabel(
+            'Каждая строка — команда. FullN1, FullN2… → отдельные дипломы.\n{NAME} — участник; {TRAINER} — первый тренер FullTr….' if team else
+            'Каждая строка — один диплом, как в orig.\nСвяжите поля шаблона с любыми колонками Excel.')
+        self.mode_hint.Wrap(490)
+        self.mode_hint.GetParent().Layout()
+
+    def refresh_sort_fields(self):
+        selected = self.settings.sort_column or self.sort_field.GetValue()
+        choices = set()
+        try:
+            if self.paths['excel_path'].GetValue():
+                headers, _ = read_excel(self.paths['excel_path'].GetValue(), headers_only=True)
+                choices.update(headers)
+            if self.paths['pptx_path'].GetValue():
+                _, placeholders = read_template(self.paths['pptx_path'].GetValue())
+                choices.update(placeholders)
+        except DiplomaError:
             pass
-        try:
-            while True:
-                progress = self.progress_queue.get_nowait()
-                wx.CallAfter(self.progress.SetValue, int(progress))
-        except queue.Empty:
-            pass
-        try:
-            while True:
-                eta = self.eta_queue.get_nowait()
-                eta = str(eta)
-                wx.CallAfter(self.eta_label.SetLabel, f"Осталось: {eta}")
-        except queue.Empty:
-            pass
-    
-    def log_message(self, message):
-        self.log_queue.put(str(message))
-    
-    def choose_excel(self, event):
-        with wx.FileDialog(self, "Выберите Excel-файл", wildcard="Excel files (*.xlsx)|*.xlsx",
-                          style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as fileDialog:
-            if fileDialog.ShowModal() == wx.ID_OK:
-                path = fileDialog.GetPath()
-                self.excel_path = path
-                self.excel_path_ctrl.SetValue(path)
-                self.excel_name.SetLabel(os.path.basename(path))
-                self.log_message(f"Загружен Excel: {os.path.basename(path)}")
-                self.update_buttons()
-    
-    def choose_pptx(self, event):
-        with wx.FileDialog(self, "Выберите шаблон PPTX", wildcard="PowerPoint files (*.pptx)|*.pptx",
-                          style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as fileDialog:
-            if fileDialog.ShowModal() == wx.ID_OK:
-                path = fileDialog.GetPath()
-                self.pptx_path = path
-                self.pptx_path_ctrl.SetValue(path)
-                self.pptx_name.SetLabel(os.path.basename(path))
-                self.log_message(f"Загружен шаблон: {os.path.basename(path)}")
-                self.scan_placeholders()
-                self.update_buttons()
-    
-    def choose_output(self, event):
-        with wx.DirDialog(self, "Выберите папку для сохранения", style=wx.DD_DEFAULT_STYLE) as dirDialog:
-            if dirDialog.ShowModal() == wx.ID_OK:
-                path = dirDialog.GetPath()
-                self.output_dir = path
-                self.output_path_ctrl.SetValue(path)
-                self.output_name.SetLabel(os.path.basename(path) or "Папка")
-                self.log_message(f"Выбрана папка: {path}")
-                self.update_buttons()
-    
-    def scan_placeholders(self):
-        try:
-            prs = Presentation(self.pptx_path)
-            slide = prs.slides[0]
-            self.placeholders = []
-            
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for paragraph in shape.text_frame.paragraphs:
-                        matches = re.findall(r"\{([^}]+)\}", paragraph.text)
-                        self.placeholders.extend(matches)
-            
-            self.placeholders = list(set(self.placeholders))
-            
-            # Автоматически добавляем обязательные плейсхолдеры если их нет
-            mandatory = ["NAME"]
-            for mandatory_ph in mandatory:
-                if mandatory_ph not in self.placeholders:
-                    self.placeholders.append(mandatory_ph)
-            
-            self.log_message(f"Найдены плейсхолдеры: {', '.join(self.placeholders)}")
-            self.update_sort_choice()
-            self.sort_check.Enable(True)
-            self.sort_choice.Enable(True)
-            
-        except Exception as e:
-            self.log_message(f"Ошибка сканирования шаблона: {e}")
-            self.sort_check.Enable(False)
-            self.sort_choice.Enable(False)
-            self.sort_choice.Set([])
-    
-    def update_sort_choice(self):
-        if self.placeholders:
-            self.sort_choice.Set(self.placeholders)
-            self.sort_column = self.placeholders[0] if self.placeholders else ""
-            self.sort_choice.SetSelection(0)
+        if self.mode.GetSelection() == 1:
+            choices.update(['NAME', 'TRAINER'])
+        self.sort_field.SetItems(sorted(choices))
+        if selected in choices:
+            self.sort_field.SetStringSelection(selected)
+        elif choices:
+            self.sort_field.SetStringSelection('TEAMNAME' if 'TEAMNAME' in choices else sorted(choices)[0])
+        self.sort_field.Enable(self.sort.GetValue() and not self.busy)
+
+    def on_path_changed(self, event):
+        if event.GetEventObject() in [self.paths.get('excel_path'), self.paths.get('pptx_path')]:
+            self.settings.column_mapping = {}
+        if hasattr(self, 'summary'):
+            self.summary.SetLabel('Файлы изменены. Проверьте данные перед запуском.')
+        event.Skip()
+
+    def on_mode_changed(self, event):
+        self.settings.column_mapping = {}
+        self.refresh_mode_hint()
+        self.refresh_sort_fields()
+        self.summary.SetLabel('Режим изменён. Проверьте сопоставление полей.')
+
+    def on_sort_changed(self, event):
+        self.refresh_sort_fields()
+
+    def choose_path(self, key):
+        if key == 'output_dir':
+            dialog = wx.DirDialog(self, 'Папка для PDF')
         else:
-            self.sort_choice.Set([])
-            self.sort_column = ""
-    
-    def update_buttons(self):
-        if self.excel_path and self.pptx_path and self.output_dir and self.placeholders:
-            self.mapping_btn.Enable(True)
-            if self.column_mapping:
-                self.generate_btn.Enable(True)
-        else:
-            self.mapping_btn.Enable(False)
-            self.generate_btn.Enable(False)
-    
-    def update_error_handling(self, event):
-        self.error_handling = {"Остановить": "stop", "Пропустить": "skip", "Заполнить по умолчанию": "default"}[self.error_handling_choice.GetStringSelection()]
-        if self.error_handling == "default":
-            self.open_default_values_window()
-        self.log_message(f"Обработка ошибок: {self.error_handling_choice.GetStringSelection()}")
-    
-    def update_sorting(self, event):
-        self.enable_sorting = self.sort_check.GetValue()
-        self.sort_column = self.sort_choice.GetStringSelection()
-        self.log_message(f"Сортировка: {'включена' if self.enable_sorting else 'выключена'}, столбец: {self.sort_column}")
-    
-    def open_default_values_window(self):
-        dialog = wx.Dialog(self, title="Значения по умолчанию", size=(400, 300))
-        panel = wx.Panel(dialog)
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        
-        self.default_entries = {}
-        for placeholder in self.placeholders:
-            hsizer = wx.BoxSizer(wx.HORIZONTAL)
-            label = wx.StaticText(panel, label=f"{placeholder}:")
-            label.SetFont(self.label_font)
-            hsizer.Add(label, flag=wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, border=5)
-            entry = wx.TextCtrl(panel, value=self.default_values.get(placeholder, "Не указано"))
-            hsizer.Add(entry, flag=wx.EXPAND)
-            self.default_entries[placeholder] = entry
-            sizer.Add(hsizer, flag=wx.EXPAND | wx.ALL, border=5)
-        
-        save_btn = wx.Button(panel, label="Сохранить")
-        save_btn.Bind(wx.EVT_BUTTON, lambda evt: self.save_default_values(dialog))
-        sizer.Add(save_btn, flag=wx.ALIGN_CENTER | wx.ALL, border=10)
-        
-        panel.SetSizer(sizer)
-        dialog.ShowModal()
-    
-    def save_default_values(self, dialog):
-        self.default_values = {ph: entry.GetValue() for ph, entry in self.default_entries.items()}
-        self.log_message("Значения по умолчанию сохранены")
-        dialog.Destroy()
-    
-    def open_mapping_window(self, event):
-        if not self.excel_path or not self.pptx_path:
-            wx.MessageBox("Сначала выберите Excel и PPTX!", "Ошибка", wx.OK | wx.ICON_ERROR)
+            extension = 'xlsx' if key == 'excel_path' else 'pptx'
+            dialog = wx.FileDialog(self, 'Выберите файл', wildcard=f'*.{extension}|*.{extension}',
+                                   style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST)
+        with dialog:
+            if dialog.ShowModal() == wx.ID_OK:
+                self.paths[key].SetValue(dialog.GetPath())
+                if key in ('excel_path', 'pptx_path'):
+                    self.settings.column_mapping = {}
+                self.refresh_sort_fields()
+
+    def report_error(self, exc):
+        logging.exception('Operation failed')
+        message = str(exc) if isinstance(exc, DiplomaError) else f'Не удалось выполнить операцию: {exc}'
+        self.log(message)
+        wx.MessageBox(message, 'Не удалось продолжить', wx.OK | wx.ICON_ERROR, self)
+
+    def open_mapping(self, event):
+        try:
+            settings = self.collect_settings()
+            headers, _ = read_excel(settings.excel_path, headers_only=True)
+            _, placeholders = read_template(settings.pptx_path)
+        except Exception as exc:
+            self.report_error(exc)
             return
-        
-        wb = load_workbook(self.excel_path)
-        ws = wb.active
-        headers = [cell.value or f"Столбец {chr(65+i)}" for i, cell in enumerate(ws[1])]
-        
-        dialog = wx.Dialog(self, title="Сопоставление плейсхолдеров", size=(400, 400))
+        mapping = auto_mapping(placeholders, headers, settings.mode)
+        mapping.update({ph: h for ph, h in settings.column_mapping.items() if h in headers or not h})
+        dialog = wx.Dialog(self, title='Поля диплома', size=(820, 600), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        dialog.SetMinSize((680, 400))
         panel = wx.Panel(dialog)
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        
-        self.mapping_choices = {}
-        for placeholder in self.placeholders:
-            hsizer = wx.BoxSizer(wx.HORIZONTAL)
-            label = wx.StaticText(panel, label=f"{placeholder}:")
-            label.SetFont(self.label_font)
-            hsizer.Add(label, flag=wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, border=5)
-            choice = wx.Choice(panel, choices=["Игнорировать"] + headers)
-            choice.SetStringSelection(self.column_mapping.get(placeholder, "Игнорировать"))
-            hsizer.Add(choice, flag=wx.EXPAND)
-            self.mapping_choices[placeholder] = choice
-            sizer.Add(hsizer, flag=wx.EXPAND | wx.ALL, border=5)
-        
-        save_btn = wx.Button(panel, label="Сохранить")
-        save_btn.Bind(wx.EVT_BUTTON, lambda evt: self.save_mapping(dialog))
-        auto_map_btn = wx.Button(panel, label="Автосопоставление")
-        auto_map_btn.Bind(wx.EVT_BUTTON, lambda evt: self.auto_map(headers))
-        check_btn = wx.Button(panel, label="Проверить данные")
-        check_btn.Bind(wx.EVT_BUTTON, lambda evt: self.check_data(headers, ws))
-        
-        sizer.Add(save_btn, flag=wx.ALIGN_CENTER | wx.ALL, border=5)
-        sizer.Add(auto_map_btn, flag=wx.ALIGN_CENTER | wx.ALL, border=5)
-        sizer.Add(check_btn, flag=wx.ALIGN_CENTER | wx.ALL, border=5)
-        
-        panel.SetSizer(sizer)
-        dialog.ShowModal()
-    
-    def save_mapping(self, dialog):
-        self.column_mapping = {
-            ph: choice.GetStringSelection()
-            for ph, choice in self.mapping_choices.items()
-            if choice.GetStringSelection() != "Игнорировать"
-        }
-        self.log_message("Сопоставление сохранено")
-        self.update_buttons()
-        dialog.Destroy()
-    
-    def auto_map(self, headers):
-        synonyms = {
-            "NAME": ["FullN", "ФИО", "Имя", "Name", "Full Name", "Участник"],
-            "ORG": ["ORG", "Организация", "Учреждение", "Школа", "Organization"],
-            "TEAM": ["TEAMNAME", "Команда", "Team", "Название команды"],
-            "CAT": ["CAT", "Категория", "Category", "Номинация", "Возраст"],
-            "TRAINER": ["FullTr", "Тренер", "Руководитель", "Teacher", "Coach"],
-            "DATE": ["Дата", "Date", "Год", "Year"],
-            "PLACE": ["Место", "Place", "Position", "Rank"],
-            "CITY": ["Город", "City", "Населенный пункт", "Location"]
-        }
-        
-        for placeholder in self.placeholders:
-            choice = self.mapping_choices[placeholder]
-            
-            # Пытаемся найти точное совпадение
-            found = False
-            for header in headers:
-                if header and placeholder.upper() == header.upper():
-                    choice.SetStringSelection(header)
-                    found = True
-                    break
-            
-            # Если не нашли, ищем по синонимам
-            if not found:
-                for header in headers:
-                    if header:
-                        # Проверяем синонимы
-                        for syn_list in synonyms.values():
-                            for syn in syn_list:
-                                if syn.lower() in header.lower():
-                                    choice.SetStringSelection(header)
-                                    found = True
-                                    break
-                            if found:
-                                break
-                    if found:
-                        break
-            
-            # Если всё равно не нашли, ставим первый столбец с участником
-            if not found and placeholder == "NAME":
-                for header in headers:
-                    if header and ("FullN" in header or "ФИО" in header):
-                        choice.SetStringSelection(header)
-                        break
-    
-    def check_data(self, headers, ws):
-        errors = []
-        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
-            for placeholder, col_name in self.column_mapping.items():
-                col_idx = headers.index(col_name) if col_name in headers else ord(col_name) - ord('A')
-                if row[col_idx] is None:
-                    errors.append(f"Строка {row_idx}: пустое поле {placeholder} ({col_name})")
-        if errors:
-            wx.MessageBox(
-                "\n".join(errors[:5]) + (f"\n...и ещё {len(errors)-5} ошибок" if len(errors) > 5 else ""),
-                "Предупреждение", wx.OK | wx.ICON_WARNING
-            )
-        else:
-            wx.MessageBox("Ошибок не найдено", "Проверка", wx.OK | wx.ICON_INFORMATION)
-    
-    def start_generation(self, event):
-        if not all(self.column_mapping.values()):
-            wx.MessageBox("Не все плейсхолдеры сопоставлены!", "Ошибка", wx.OK | wx.ICON_ERROR)
+        panel.SetBackgroundColour(BG)
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(self.label(panel, 'Свяжите шаблон с таблицей', 18, bold=True), 0, wx.ALL, 18)
+        note = self.label(panel, 'Каждое поле шаблона получает значение из выбранной колонки.\nЗначения справа используются при выборе «Заполнить по умолчанию».', 10, MUTED)
+        outer.Add(note, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 18)
+        scroll = wx.lib.scrolledpanel.ScrolledPanel(panel)
+        grid = wx.FlexGridSizer(cols=3, hgap=12, vgap=12)
+        grid.AddGrowableCol(1, 1)
+        grid.AddGrowableCol(2, 1)
+        for title in ['Поле шаблона', 'Колонка Excel', 'По умолчанию']:
+            grid.Add(self.label(scroll, title, 10, bold=True))
+        choices, defaults = {}, {}
+        for ph in placeholders:
+            grid.Add(self.label(scroll, '{' + ph + '}'), 0, wx.ALIGN_CENTER_VERTICAL)
+            automatic = settings.mode == 'team' and ph in ('NAME', 'TRAINER')
+            choice = wx.Choice(scroll, choices=['Не сопоставлено'] + headers)
+            if automatic:
+                choice.SetItems(['FullN… (участник)' if ph == 'NAME' else 'FullTr… (первый тренер)'])
+                choice.SetSelection(0)
+                choice.Enable(False)
+            else:
+                choice.SetStringSelection(mapping.get(ph, '') or 'Не сопоставлено')
+            default = wx.TextCtrl(scroll, value=settings.default_values.get(ph, ''))
+            grid.Add(choice, 0, wx.EXPAND)
+            grid.Add(default, 0, wx.EXPAND)
+            choices[ph], defaults[ph] = choice, default
+        scroll.SetSizer(grid)
+        scroll.SetupScrolling(scroll_x=False)
+        outer.Add(scroll, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 18)
+        actions = wx.BoxSizer(wx.HORIZONTAL)
+        def autofill(event):
+            guessed = auto_mapping(placeholders, headers, settings.mode)
+            for ph, choice in choices.items():
+                if choice.IsEnabled():
+                    choice.SetStringSelection(guessed.get(ph, '') or 'Не сопоставлено')
+        actions.Add(self.button(panel, 'Автосопоставление', autofill), 0)
+        actions.AddStretchSpacer()
+        cancel = wx.Button(panel, wx.ID_CANCEL, 'Отмена')
+        save = wx.Button(panel, wx.ID_OK, 'Сохранить')
+        save.SetDefault()
+        actions.Add(cancel, 0, wx.RIGHT, 8)
+        actions.Add(save, 0)
+        outer.Add(actions, 0, wx.EXPAND | wx.ALL, 18)
+        panel.SetSizer(outer)
+        wrapper = wx.BoxSizer(wx.VERTICAL)
+        wrapper.Add(panel, 1, wx.EXPAND)
+        dialog.SetSizer(wrapper)
+        dialog.CentreOnParent()
+        with dialog:
+            if dialog.ShowModal() == wx.ID_OK:
+                self.settings.column_mapping = {ph: (c.GetStringSelection() if c.GetSelection() > 0 else '')
+                                                for ph, c in choices.items() if c.IsEnabled()}
+                self.settings.default_values = {ph: entry.GetValue() for ph, entry in defaults.items()}
+                self.persist()
+                self.log('Сопоставление полей сохранено.')
+                self.refresh_sort_fields()
+
+    def set_busy(self, busy, checking=False):
+        self.busy = busy
+        for item in self.locked_controls:
+            item.Enable(not busy)
+        self.sort_field.Enable(not busy and self.sort.GetValue())
+        self.start_btn.Enable(not busy)
+        self.stop_btn.Enable(busy)
+        self.badge.SetLabel('ПРОВЕРКА' if checking else 'ГЕНЕРАЦИЯ' if busy else 'ГОТОВ К РАБОТЕ')
+        self.status.SetLabel('Проверка данных…' if checking else 'Создаём дипломы…' if busy else self.status.GetLabel())
+
+    def launch(self, checking):
+        if self.busy:
             return
-        self.generate_btn.Enable(False)
-        self.stop_btn.Enable(True)
-        self.progress.SetValue(0)
-        self.eta_label.SetLabel("Осталось: 00:00")
+        self.persist()
+        settings = copy.deepcopy(self.settings)
         self.stop_event.clear()
-        self.generation_thread = threading.Thread(target=self.run_generation)
-        self.generation_thread.start()
-    
-    def run_generation(self):
-        try:
-            success = generate_diplomas(
-                self.excel_path, self.pptx_path, self.output_dir,
-                self.column_mapping, self.error_handling, self.default_values,
-                self.font_settings, self.sort_column, self.enable_sorting,
-                self.log_queue, self.progress_queue, self.eta_queue, self.stop_event
-            )
-            if success:
-                wx.CallAfter(wx.MessageBox, f"Дипломы сгенерированы в: {self.output_dir}", "Успех", wx.OK | wx.ICON_INFORMATION)
-        except Exception as e:
-            wx.CallAfter(wx.MessageBox, str(e), "Ошибка", wx.OK | wx.ICON_ERROR)
-        finally:
-            wx.CallAfter(self.reset_buttons)
-    
+        self.set_busy(True, checking)
+        self.gauge.SetValue(0)
+        self.progress_text.SetLabel('Подготовка данных…')
+        def work():
+            try:
+                plan = prepare_plan(settings, self.stop_event)
+                self.events.put(('plan', plan))
+                if checking:
+                    self.events.put(('checked', None))
+                else:
+                    count = generate(settings, self.log,
+                                     lambda done, total, eta: self.events.put(('progress', (done, total, eta))),
+                                     self.stop_event, plan=plan)
+                    self.events.put(('complete', (count, settings.output_dir)))
+            except Cancelled:
+                self.events.put(('cancelled', None))
+            except Exception as exc:
+                logging.exception('Background operation failed')
+                self.events.put(('error', str(exc)))
+            finally:
+                self.events.put(('idle', None))
+        self.worker = threading.Thread(target=work, name='diploma-generation', daemon=True)
+        self.worker.start()
+
+    def check_data(self, event):
+        self.launch(True)
+
+    def start_generation(self, event):
+        self.launch(False)
+
     def stop_generation(self, event):
         self.stop_event.set()
-        self.progress.SetValue(0)
-        self.log_message("Прерывание генерации...")
-        threading.Thread(target=self.cleanup_powerpoint, daemon=True).start()
-        if self.generation_thread:
-            self.generation_thread.join(timeout=5)
-        self.reset_buttons()
-    
-    def cleanup_powerpoint(self):
-        for proc in psutil.process_iter(['name']):
-            if proc.info['name'].lower() == 'powerpnt.exe':
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except psutil.TimeoutExpired:
-                    proc.kill()
-        for file in os.listdir():
-            if file.startswith("temp_") and file.endswith((".pptx", ".jpg", ".pdf")):
-                try:
-                    os.remove(file)
-                except:
-                    pass
-    
-    def reset_buttons(self):
-        self.generate_btn.Enable(bool(self.column_mapping))
         self.stop_btn.Enable(False)
-        self.eta_label.SetLabel("Осталось: 00:00")
-    
-    def on_closing(self, event):
-        if self.generation_thread and self.generation_thread.is_alive():
-            self.stop_event.set()
-            self.cleanup_powerpoint()
-            self.generation_thread.join(timeout=5)
-        for file in os.listdir():
-            if file.startswith("temp_") and file.endswith((".pptx", ".jpg", ".pdf")):
-                try:
-                    os.remove(file)
-                except:
-                    pass
+        self.status.SetLabel('Останавливаем…')
+        self.log('Запрошена остановка. Уже созданные PDF сохраняются.')
+
+    def log(self, message):
+        self.events.put(('log', str(message)))
+        logging.info('%s', message)
+
+    def on_timer(self, event):
+        for _ in range(100):
+            try:
+                kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == 'log':
+                self.log_ctrl.AppendText(f'{datetime.now():%H:%M:%S}  {payload}\n')
+            elif kind == 'plan':
+                self.checked_warnings = payload.warnings[:30]
+                selected = self.sort_field.GetValue()
+                choices = sorted(set(payload.headers + payload.placeholders +
+                                     (['NAME', 'TRAINER'] if self.settings.mode == 'team' else [])))
+                self.sort_field.SetItems(choices)
+                if selected in choices:
+                    self.sort_field.SetStringSelection(selected)
+                self.summary.SetLabel(f'Дипломов: {len(payload.records)}\nПропущено: {payload.skipped} · предупреждений: {len(payload.warnings)}\nПоля: ' + ', '.join(payload.placeholders))
+                self.summary.Wrap(420)
+                self.summary.GetParent().Layout()
+                preview = [f'Строка {r.row}: {r.values.get("NAME", "")}'
+                           for r in payload.records[:5]]
+                self.log('Первые дипломы:\n' + '\n'.join(preview))
+            elif kind == 'progress':
+                done, total, eta = payload
+                self.gauge.SetValue(round(done / total * 100))
+                self.progress_text.SetLabel(f'{done} из {total}  ·  осталось {eta // 60:02d}:{eta % 60:02d}')
+            elif kind == 'checked':
+                # A check has no export stage to emit the warnings.
+                for warning in self.checked_warnings:
+                    self.log(warning)
+                self.status.SetLabel('Данные проверены')
+                self.progress_text.SetLabel('Можно запускать генерацию')
+                self.log('Проверка завершена. Экспорт PDF при проверке не выполнялся.')
+            elif kind == 'complete':
+                count, self.last_output = payload
+                self.status.SetLabel(f'Готово! Дипломов: {count}')
+                self.gauge.SetValue(100)
+                self.log(f'Генерация завершена. Папка: {self.last_output}')
+            elif kind == 'cancelled':
+                self.status.SetLabel('Остановлено')
+                self.log('Операция остановлена. Можно начать снова.')
+            elif kind == 'error':
+                self.status.SetLabel('Не удалось завершить')
+                self.log(payload)
+                if not self.closing:
+                    wx.MessageBox(payload + '\n\nПодробности доступны в журнале.', 'Ошибка', wx.OK | wx.ICON_ERROR, self)
+            elif kind == 'idle':
+                self.set_busy(False)
+                if self.closing:
+                    self.timer.Stop()
+                    self.Destroy()
+                    return
+
+    def open_output(self, event):
+        path = self.last_output or self.paths['output_dir'].GetValue()
+        try:
+            if not path or not Path(path).is_dir():
+                raise DiplomaError('Папка результата ещё не создана или недоступна.')
+            os.startfile(str(Path(path).resolve()))
+        except Exception as exc:
+            self.report_error(exc)
+
+    def open_log(self, event):
+        try:
+            os.startfile(str(app_data_dir() / 'diploma.log'))
+        except Exception as exc:
+            self.report_error(exc)
+
+    def on_close(self, event):
+        self.persist()
+        if self.busy:
+            self.closing = True
+            self.stop_generation(None)
+            if event.CanVeto():
+                event.Veto()
+                return
         self.timer.Stop()
         self.Destroy()
-    
-    def load_config(self):
-        try:
-            with open("config.json", "r", encoding="utf-8") as f:
-                config = json.load(f)
-                self.excel_path = config.get("excel_path", "")
-                self.pptx_path = config.get("pptx_path", "")
-                self.output_dir = config.get("output_dir", "")
-                self.column_mapping = config.get("column_mapping", {})
-                self.error_handling = config.get("error_handling", "stop")
-                self.default_values = config.get("default_values", {})
-                self.sort_column = config.get("sort_column", "")
-                self.enable_sorting = config.get("enable_sorting", True)
-                if self.excel_path:
-                    self.excel_path_ctrl.SetValue(self.excel_path)
-                    self.excel_name.SetLabel(os.path.basename(self.excel_path))
-                if self.pptx_path:
-                    self.pptx_path_ctrl.SetValue(self.pptx_path)
-                    self.pptx_name.SetLabel(os.path.basename(self.pptx_path))
-                    self.scan_placeholders()
-                if self.output_dir:
-                    self.output_path_ctrl.SetValue(self.output_dir)
-                    self.output_name.SetLabel(os.path.basename(self.output_dir) or "Папка")
-                self.error_handling_choice.SetStringSelection({"stop": "Остановить", "skip": "Пропустить", "default": "Заполнить по умолчанию"}[self.error_handling])
-                self.sort_check.SetValue(self.enable_sorting)
-                if self.sort_column and self.placeholders:
-                    self.sort_choice.SetSelection(self.placeholders.index(self.sort_column) if self.sort_column in self.placeholders else 0)
-                self.update_buttons()
-        except FileNotFoundError:
-            pass
 
-if __name__ == "__main__":
-    app = wx.App()
-    frame = DiplomaGeneratorApp()
-    frame.Show()
-    app.MainLoop()
+
+def main():
+    multiprocessing.freeze_support()
+    if len(sys.argv) > 1 and sys.argv[1] == '--self-test':
+        if len(sys.argv) != 3:
+            raise SystemExit(2)
+        from diagnostics import self_test
+        raise SystemExit(self_test(sys.argv[2]))
+    app = wx.App(False)
+    try:
+        handler = RotatingFileHandler(app_data_dir() / 'diploma.log', maxBytes=2_000_000,
+                                      backupCount=3, encoding='utf-8')
+        logging.basicConfig(level=logging.INFO, handlers=[handler],
+                            format='%(asctime)s %(levelname)s %(message)s')
+        frame = DiplomaGeneratorApp()
+        frame.Show()
+        app.MainLoop()
+    except Exception as exc:
+        logging.exception('Application startup failed')
+        wx.MessageBox(f'Не удалось запустить приложение: {exc}', 'Ошибка запуска', wx.OK | wx.ICON_ERROR)
+
+
+if __name__ == '__main__':
+    main()
